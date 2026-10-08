@@ -22,6 +22,28 @@ public class IniPatcherTests
     private static IniEdit Edit(string section, string key, string value) =>
         new(section, key, null, value);
 
+    /// <summary>以 ; 或 # 开头的行（允许前导空白）。</summary>
+    private static bool IsComment(string line)
+    {
+        var trimmed = line.TrimStart();
+        return trimmed.StartsWith(';') || trimmed.StartsWith('#');
+    }
+
+    /// <summary>断言 <paramref name="input"/> 的每一行都按原顺序出现在 <paramref name="output"/> 里。</summary>
+    private static void AssertIsSupersequence(string[] input, string[] output)
+    {
+        var i = 0;
+        foreach (var line in output)
+        {
+            if (i < input.Length && input[i] == line)
+            {
+                i++;
+            }
+        }
+
+        Assert.Equal(input.Length, i);
+    }
+
     [Fact]
     public void Replaces_value_in_place_and_preserves_comment_lines()
     {
@@ -39,10 +61,9 @@ public class IniPatcherTests
     }
 
     [Fact]
-    public void Output_line_count_is_never_less_than_input()
+    public void Output_preserves_every_input_line_in_order()
     {
         var patcher = new IniPatcher();
-        var inputLines = Sample.Split("\r\n").Length;
 
         var result = patcher.Patch(Sample, new[]
         {
@@ -52,14 +73,35 @@ public class IniPatcherTests
             Edit("Upscalers", "BrandNewKey", "1"), // key 不存在
         });
 
-        Assert.True(result.Content.Split(result.DetectedNewLine).Length >= inputLines);
+        var outputLines = result.Content.Split(result.DetectedNewLine);
+
+        // 只断言「输出行数 >= 输入行数」是恒真式：实现从不删行，那个断言唯一能捕获的退化
+        // 是「有人开始删行」，而它捕不到「行放错了位置」（行数完全正确）。超序列断言同时
+        // 覆盖删行、改行、重排三类退化——输入的每一行都必须按原顺序出现在输出里。
+        // 注意必须在 split 之后的行数组上比，比原文会被行尾归一化误报。
+        //
+        // 上面两条就地命中的 edit 是**契约允许**的改行（「只替换 = 右侧，左半部分原样保留」），
+        // 所以超序列要比的是「已应用就地替换后的输入行」。直接拿原始 Sample 的行去比是恒假的：
+        // Dx12Upscaler=auto 本来就不应该出现在输出里。这里把预期改动显式写成映射，
+        // 于是断言仍然要求：左侧原样保留、其余每一行逐字原样且顺序不变。
+        var survivingInputLines = Sample
+            .Split("\r\n")
+            .Select(l => l switch
+            {
+                "Dx12Upscaler=auto" => "Dx12Upscaler=ffx",
+                "LogToFile=auto" => "LogToFile=true",
+                _ => l,
+            })
+            .ToArray();
+
+        AssertIsSupersequence(survivingInputLines, outputLines);
     }
 
     [Fact]
     public void All_comment_lines_survive_verbatim()
     {
         var patcher = new IniPatcher();
-        var originalComments = Sample.Split("\r\n").Where(l => l.StartsWith(';')).ToArray();
+        var originalComments = Sample.Split("\r\n").Where(IsComment).ToArray();
 
         var result = patcher.Patch(Sample, new[]
         {
@@ -68,11 +110,15 @@ public class IniPatcherTests
             Edit("Log", "LogLevel", "2"),
         });
 
-        var outputLines = result.Content.Split(result.DetectedNewLine);
-        foreach (var comment in originalComments)
-        {
-            Assert.Contains(comment, outputLines);
-        }
+        var outputComments = result.Content
+            .Split(result.DetectedNewLine)
+            .Where(l => IsComment(l) && l != "; added by OptiScaler Deployer")
+            .ToArray();
+
+        // 有序 + 带重数的比对。旧写法 Assert.Contains(comment, outputLines) 是**集合包含**：
+        // 真 OptiScaler.ini 里 `; ----` 横幅重复了几十次（L1/L3/L19/L21 完全相同），
+        // 删掉其中三条只要还剩一条相同的就照样绿。排掉 AddedByDeployer 是因为它是新增的注释。
+        Assert.Equal(originalComments, outputComments);
     }
 
     [Fact]
@@ -92,11 +138,16 @@ public class IniPatcherTests
     {
         var patcher = new IniPatcher();
 
-        var result = patcher.Patch(Sample, new[] { Edit("Log", "SingleFile", "true") });
+        // OldValue 故意传一个非 null 的脏值：追加项的 OldValue 必须由 patcher 清成 null，
+        // 否则拿上一轮 patch 过的 edits 再 patch 一次时，UI 会渲染出一个根本不存在的
+        // 「旧值 → 新值」diff。用 Edit() helper（它传 null）测不出这件事——那测的是 helper。
+        var stale = new IniEdit("Log", "SingleFile", "stale-from-a-previous-run", "true");
 
-        var logIndex = result.Content.IndexOf("[Log]", StringComparison.Ordinal);
-        var appendedIndex = result.Content.IndexOf("SingleFile=true", StringComparison.Ordinal);
-        Assert.True(appendedIndex > logIndex);
+        var result = patcher.Patch(Sample, new[] { stale });
+
+        // 精确全文断言：[Log] 是 Sample 的最后一个 section，追加必须落在 LogLevel 之后、
+        // 也就是文件末尾。只断言「在 [Log] 之后」区分不出「落在段末」与「落在下一个 section 里」。
+        Assert.Equal(Sample + "SingleFile=true\r\n", result.Content);
         Assert.Single(result.AppendedEdits);
         Assert.Null(result.AppendedEdits[0].OldValue);
     }
@@ -144,6 +195,25 @@ public class IniPatcherTests
 
         Assert.Equal("[Upscalers]\r\nDx12Upscaler=auto\r\nNewKey=1\r\n\r\n[Log]\r\nLogToFile=auto\r\n",
             result.Content);
+    }
+
+    [Fact]
+    public void Appends_into_two_different_existing_sections_both_land_at_their_own_section_end()
+    {
+        // 这是 Critical 缺陷的回归看守：插入使**后半部分所有 section** 的锚点过期，
+        // 只更新当前 section 会让后一个 section 的新键落到它的 section 头之前，
+        // 也就是写进上一个 section。既有的追加测试全都只碰一个 section，盖不到。
+        const string ini = "[A]\r\nA1=1\r\n\r\n[B]\r\nB1=1\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[]
+        {
+            Edit("A", "X1", "1"),
+            Edit("A", "X2", "2"),
+            Edit("B", "Y", "9"),
+        });
+
+        Assert.Equal("[A]\r\nA1=1\r\nX1=1\r\nX2=2\r\n\r\n[B]\r\nB1=1\r\nY=9\r\n", result.Content);
     }
 
     [Fact]
@@ -233,6 +303,21 @@ public class IniPatcherTests
     }
 
     [Fact]
+    public void Section_and_key_with_surrounding_whitespace_are_trimmed_instead_of_creating_a_duplicate_section()
+    {
+        // " Log " 匹配不上文件里的 "Log"，旧行为会往文件末尾追加一个字面的 [ Log ] 段，
+        // 而 INI 解析器读它时 trim 内侧空格得到 Log —— 游戏文件里于是出现两个同名 section。
+        const string ini = "[Log]\r\nLogToFile=auto\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit(" Log ", " LogToFile ", "true") });
+
+        Assert.Equal("[Log]\r\nLogToFile=true\r\n", result.Content);
+        Assert.Single(result.AppliedEdits);
+        Assert.Empty(result.AppendedEdits);
+    }
+
+    [Fact]
     public void Mixed_line_endings_still_get_patched_instead_of_silently_skipping()
     {
         // 第 2 行以 bare LF 结尾。改之前这条 edit 会静默不生效：
@@ -277,5 +362,71 @@ public class IniPatcherTests
 
         Assert.True(iZzz >= 0 && iZzz < iAaa && iAaa < iMmm,
             $"追加顺序应为 Zzz、Aaa、Mmm（实际下标 {iZzz}, {iAaa}, {iMmm}）");
+    }
+
+    [Fact]
+    public void Section_header_with_trailing_inline_comment_is_still_recognised()
+    {
+        // `[B] ; note` 是合法 INI 写法。不认它的话 currentSection 会停留在 A，
+        // 于是针对 A/K 的 edit 会改到物理上位于 B 段的那个 K——改错 section，静默。
+        const string ini = "[A]\r\nX=1\r\n[B] ; note\r\nK=2\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "K", "9") });
+
+        // A 段没有 K，所以应当**追加**到 A 段末尾，B 段的 K=2 一个字符都不能动
+        Assert.Equal("[A]\r\nX=1\r\nK=9\r\n[B] ; note\r\nK=2\r\n", result.Content);
+        Assert.Single(result.AppendedEdits);
+        Assert.Empty(result.AppliedEdits);
+    }
+
+    [Fact]
+    public void Line_starting_with_bracket_but_without_closing_bracket_is_skipped_entirely()
+    {
+        // `[Foo=bar` 不是 section 头。旧行为会把它当成键名 `[Foo` 解析，
+        // 那是在往游戏文件里制造一个谁也不认识的键。
+        // 第二条 edit 的 Key 故意取成 `[Broken`——正好等于那条畸形行 `=` 的左侧：
+        // 只有这样才能观察到「整行跳过」与「掉进键解析」的区别。对任何正常 Key
+        // 而言两者结果相同（畸形行匹配不上就被静默忽略），所以只靠一条普通 edit 钉不住这个分支。
+        const string ini = "[A]\r\nK=1\r\n[Broken=bar\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "K", "9"), Edit("A", "[Broken", "9") });
+
+        // `[Broken=bar` 一个字符都不能动；`[Broken` 在 A 段不是键，所以走追加，落在段末
+        Assert.Equal("[A]\r\nK=9\r\n[Broken=bar\r\n[Broken=9\r\n", result.Content);
+        Assert.Single(result.AppliedEdits);
+        Assert.Single(result.AppendedEdits);
+    }
+
+    [Fact]
+    public void Hash_comment_lines_are_never_parsed_as_keys()
+    {
+        // Sample 常量里没有 # 注释行，所以 All_comment_lines_survive_verbatim 单靠它盖不到 # 分支。
+        // 这里用一个 Key 字面上等于 # 注释行 `=` 左侧的 edit 来钉住：# 行必须整行当注释跳过，
+        // 绝不参与键解析。少了 `|| trimmed.StartsWith('#')` 的话实现会去改写这条注释，
+        // 而 IIniPatcher 承诺「所有以 ; 或 # 开头的行原样保留」。
+        const string ini = "[A]\r\n#Legacy=1\r\nK=2\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "#Legacy", "9") });
+
+        // 注释行一个字符都不能动；#Legacy 在 A 段不是键，所以走追加，落在段末
+        Assert.Equal("[A]\r\n#Legacy=1\r\nK=2\r\n#Legacy=9\r\n", result.Content);
+        Assert.Empty(result.AppliedEdits);
+        Assert.Single(result.AppendedEdits);
+    }
+
+    [Fact]
+    public void Input_without_trailing_newline_gains_one_when_edits_are_applied()
+    {
+        // 已知且**有意**的行为：edits 非空时 Join 会给不以换行结尾的输入补一个尾换行。
+        // 钉住它是为了防止后来者把这当 bug「修」掉——空 edits 走早返回分支，不补。
+        const string ini = "[A]\r\nK=1";       // 注意：不以换行结尾
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "K", "2") });
+
+        Assert.Equal("[A]\r\nK=2\r\n", result.Content);
     }
 }

@@ -19,12 +19,27 @@ public sealed class IniPatcher : IIniPatcher
 
     public IniPatchResult Patch(string originalContent, IReadOnlyList<IniEdit> edits)
     {
+        // 用户手写 profile JSON 时很容易在 Section / Key 前后多打空格（" Log "）。不归一化的话
+        // 它匹配不上文件里的 "Log"，会掉进「新建 section」分支往文件末尾追加一个字面的
+        // `[ Log ]` 段——而 INI 解析器读它时会 trim 内侧空格得到 Log，于是游戏文件里出现两个
+        // 同名 section、值互相冲突。这里选择 Trim 而不是拒绝：意图是明确的、错误是可恢复的，
+        // 不该让整次部署失败。归一化后的 edits 也会原样出现在返回的 AppliedEdits / AppendedEdits 里。
+        var normalizedEdits = new List<IniEdit>(edits.Count);
+        foreach (var edit in edits)
+        {
+            normalizedEdits.Add(edit with
+            {
+                Section = edit.Section?.Trim() ?? string.Empty,
+                Key = edit.Key?.Trim() ?? string.Empty,
+            });
+        }
+
         // 空 Section / 空 Key 是**硬错误**，不是「匹配不上就算了」：Section 为空会命中
         // 第一个 section 头之前的前言区，Key 为空会命中任何以 = 开头的畸形行；两者都
         // 会让「新建 section」分支往用户的 OptiScaler.ini 末尾追加一个 [] 段——那是往
         // 游戏文件里写垃圾。守卫放在这一层而不是调用方：IniPatcher 是真正落笔的地方，
         // 而 edits 可能来自用户自己写的 profile JSON。
-        foreach (var edit in edits)
+        foreach (var edit in normalizedEdits)
         {
             if (string.IsNullOrWhiteSpace(edit.Section) || string.IsNullOrWhiteSpace(edit.Key))
             {
@@ -37,7 +52,7 @@ public sealed class IniPatcher : IIniPatcher
         var newLine = DetectNewLine(originalContent);
         var lines = SplitLines(originalContent);
 
-        if (edits.Count == 0)
+        if (normalizedEdits.Count == 0)
         {
             return new IniPatchResult(originalContent, Array.Empty<IniEdit>(), Array.Empty<IniEdit>(), newLine);
         }
@@ -47,7 +62,7 @@ public sealed class IniPatcher : IIniPatcher
         // 规范保证（.NET 8 实测幸存键的相对顺序不变，但那是实现细节、不是契约）。
         var pending = new Dictionary<(string Section, string Key), IniEdit>(KeyComparer.Instance);
         var orderedKeys = new List<(string Section, string Key)>();
-        foreach (var edit in edits)
+        foreach (var edit in normalizedEdits)
         {
             var key = (edit.Section, edit.Key);
             if (!pending.ContainsKey(key))
@@ -59,7 +74,7 @@ public sealed class IniPatcher : IIniPatcher
         }
 
         var applied = new List<IniEdit>();
-        var sectionLastLineIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var sectionAppendAnchor = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var currentSection = string.Empty;
 
         for (var i = 0; i < lines.Count; i++)
@@ -72,14 +87,19 @@ public sealed class IniPatcher : IIniPatcher
                 continue;   // 注释行：原样保留，绝不参与解析
             }
 
-            if (trimmed.StartsWith('[') && trimmed.TrimEnd().EndsWith(']'))
+            if (trimmed.StartsWith('['))
             {
-                if (currentSection.Length > 0)
+                // 以 [ 开头的行一律不当作键解析：要么是 section 头，要么整行跳过。
+                if (TryReadSectionHeader(trimmed, out var sectionName))
                 {
-                    sectionLastLineIndex[currentSection] = LastContentLineIndex(lines, i - 1);
+                    if (currentSection.Length > 0)
+                    {
+                        sectionAppendAnchor[currentSection] = LastContentLineIndex(lines, i - 1);
+                    }
+
+                    currentSection = sectionName;
                 }
 
-                currentSection = trimmed.TrimEnd()[1..^1].Trim();
                 continue;
             }
 
@@ -102,7 +122,7 @@ public sealed class IniPatcher : IIniPatcher
 
         if (currentSection.Length > 0)
         {
-            sectionLastLineIndex[currentSection] = LastContentLineIndex(lines, lines.Count - 1);
+            sectionAppendAnchor[currentSection] = LastContentLineIndex(lines, lines.Count - 1);
         }
 
         var appended = new List<IniEdit>();
@@ -115,11 +135,24 @@ public sealed class IniPatcher : IIniPatcher
                 continue;   // 已在上面就地替换过
             }
 
-            if (sectionLastLineIndex.TryGetValue(edit.Section, out var insertAt) && insertAt >= 0)
+            if (sectionAppendAnchor.TryGetValue(edit.Section, out var anchorLine) && anchorLine >= 0)
             {
-                lines.Insert(insertAt + 1, edit.Key + "=" + edit.NewValue);
-                // 插入点下移一行，同一 section 的下一条接着排在它后面
-                sectionLastLineIndex[edit.Section] = insertAt + 1;
+                lines.Insert(anchorLine + 1, edit.Key + "=" + edit.NewValue);
+
+                // 插入使插入点之后的所有行整体下移一行，因此**每一个**指向后半部分的锚点都过期了。
+                // 只更新当前 section 会让后面 section 的锚点偏差，偏差累积到超过该 section 的长度时，
+                // 新键会落到 section 头之前——也就是写进上一个 section，直接击穿 section 作用域这条
+                // 不变量。section 总数最多几十个，整体扫一遍的代价可以忽略。
+                foreach (var pair in sectionAppendAnchor.ToArray())
+                {
+                    if (pair.Value >= anchorLine + 1)
+                    {
+                        sectionAppendAnchor[pair.Key] = pair.Value + 1;
+                    }
+                }
+
+                // 当前 section 的锚点推到刚插入的那一行，同 section 的下一条接着排在它后面
+                sectionAppendAnchor[edit.Section] = anchorLine + 1;
             }
             else
             {
@@ -135,16 +168,51 @@ public sealed class IniPatcher : IIniPatcher
                 }
 
                 lines.Add(edit.Key + "=" + edit.NewValue);
-                sectionLastLineIndex[edit.Section] = lines.Count - 1;
+                sectionAppendAnchor[edit.Section] = lines.Count - 1;
             }
 
-            appended.Add(edit);
+            appended.Add(edit.WithOldValue(null));
         }
 
         return new IniPatchResult(Join(lines, newLine), applied, appended, newLine);
     }
 
-    /// <summary>从 <paramref name="from"/> 往前找最后一个非空行。避免把新键插在 section 末尾的空行之后。</summary>
+    /// <summary>
+    /// 识别 section 头：以 [ 开头、扫到**第一个** ] 为止，] 之后的内容（行内注释）一律忽略，
+    /// 内侧空白 trim 掉。没有 ] 就返回 false，整行由调用方跳过。
+    /// </summary>
+    /// <remarks>
+    /// 为什么 `]` 后面允许有内容：`[Log] ; 只写日志` 是完全合法的 INI 写法，通行解析器都认。
+    /// 要求 `]` 必须在行尾会让这一行既不是 section 头、又没有 `=`，于是被当成空行跳过——
+    /// currentSection 保持不变，后面所有键被归到**上一个** section 名下。失效方向是
+    /// 「改到别的 section 的键」与「往文件末尾追加一个重复 section」，两者都是静默的。
+    /// 为什么没有 `]` 时整行跳过而不是当键解析：`[Foo=bar` 会被解析成键名 `[Foo`，
+    /// 那是在往游戏文件里制造一个谁也不认识的键。
+    /// </remarks>
+    private static bool TryReadSectionHeader(string trimmedLine, out string sectionName)
+    {
+        sectionName = string.Empty;
+
+        var close = trimmedLine.IndexOf(']');
+        if (close < 0)
+        {
+            return false;
+        }
+
+        sectionName = trimmedLine[1..close].Trim();
+        return true;
+    }
+
+    /// <summary>
+    /// 从 <paramref name="from"/> 往前找最后一个非空白行，作为该 section 的追加锚点。
+    /// </summary>
+    /// <remarks>
+    /// 注意**注释行算内容**：真 OptiScaler.ini 里很多 section 末尾有 `; ----` 横幅，
+    /// 新键会落在横幅**之后**而不是紧贴最后一个真实键。这是有意的——横幅在语义上属于
+    /// 它上面那个 section 的收尾，把新键插在横幅与它描述的键之间才是真的拆散了注释。
+    /// 全是空白行时返回 -1；调用处那个 `>= 0` 判断在当前所有路径下恒为真（三个写入点
+    /// 都保证了非负），留着是防将来有人新增一个可能写入 -1 的路径。
+    /// </remarks>
     private static int LastContentLineIndex(List<string> lines, int from)
     {
         while (from >= 0 && lines[from].Trim().Length == 0)

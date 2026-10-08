@@ -1358,7 +1358,7 @@ Spec §8.2 的核心约束：**不重新序列化**。`OptiScaler.ini` 1571 行�
 已核实的文件事实（决定实现细节；下面每个数字都用脚本对真文件实测过）：
 - 行尾是 **CRLF**（`crlf=1571 bareLf=0`，零混合行尾）、UTF-8 **无 BOM**
 - **864 / 1571 = 55% 是注释行**。这就是「不重新序列化」从「比较好」变成「硬约束」的原因
-- **零行内注释**：所有 `;` 注释都独占一行。因此「替换 `=` 右侧」不会误删注释
+- **零行内注释**：所有 `;` 注释都独占一行。因此「替换 `=` 右侧」不会误删注释。**这条事实只对当前这份仓库根的 `OptiScaler.ini` 成立**：被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 枚举含 `manualDirectory`（用户可以指定任意本地目录作为 payload），换一份 ini 不保证仍然零行内注释——参见下面「行尾注释会被一并替换掉」那条已知限制
 - 键的写法**绝大多数**是 `Key=value`（等号两侧无空格），但有 3 个例外：`[NvngxFG]` 段的 `DispatchFlags` / `ShowDebug` / `DisableHudless` 写作 `Key = auto`（实测 L721 / L726 / L731）。所以「只换 `=` 右侧、左半部分原样保留」这条路径在真文件里**确实会走到**，不是纯理论构造
 - **同一 section 内零重复键**（实测）。所以「命中即 `pending.Remove`」不会漏改；若将来 OptiScaler 上游引入了重复键，本实现只改**第一次出现**的那个，而 OptiScaler 自己的 SimpleIni 可能读到最后一个——那种不一致会表现为「改了但没生效」，需重新评估
 - `Enabled=auto` 这个键名在 **5 个不同的 section** 里各出现一次：`[FrameGen]` L25、`[DLSS]` L664、`[OutputScaling]` L1154、`[CAS]` L1172、`[Magnifier]` L1234（全文 37 个 section，section 名零重复）—— **section 作用域匹配是硬性要求，不是优化**：不分作用域就会一次改掉五个不相干的功能开关
@@ -1421,6 +1421,28 @@ public class IniPatcherTests
     private static IniEdit Edit(string section, string key, string value) =>
         new(section, key, null, value);
 
+    /// <summary>以 ; 或 # 开头的行（允许前导空白）。</summary>
+    private static bool IsComment(string line)
+    {
+        var trimmed = line.TrimStart();
+        return trimmed.StartsWith(';') || trimmed.StartsWith('#');
+    }
+
+    /// <summary>断言 <paramref name="input"/> 的每一行都按原顺序出现在 <paramref name="output"/> 里。</summary>
+    private static void AssertIsSupersequence(string[] input, string[] output)
+    {
+        var i = 0;
+        foreach (var line in output)
+        {
+            if (i < input.Length && input[i] == line)
+            {
+                i++;
+            }
+        }
+
+        Assert.Equal(input.Length, i);
+    }
+
     [Fact]
     public void Replaces_value_in_place_and_preserves_comment_lines()
     {
@@ -1438,10 +1460,9 @@ public class IniPatcherTests
     }
 
     [Fact]
-    public void Output_line_count_is_never_less_than_input()
+    public void Output_preserves_every_input_line_in_order()
     {
         var patcher = new IniPatcher();
-        var inputLines = Sample.Split("\r\n").Length;
 
         var result = patcher.Patch(Sample, new[]
         {
@@ -1451,14 +1472,35 @@ public class IniPatcherTests
             Edit("Upscalers", "BrandNewKey", "1"), // key 不存在
         });
 
-        Assert.True(result.Content.Split(result.DetectedNewLine).Length >= inputLines);
+        var outputLines = result.Content.Split(result.DetectedNewLine);
+
+        // 只断言「输出行数 >= 输入行数」是恒真式：实现从不删行，那个断言唯一能捕获的退化
+        // 是「有人开始删行」，而它捕不到「行放错了位置」（行数完全正确）。超序列断言同时
+        // 覆盖删行、改行、重排三类退化——输入的每一行都必须按原顺序出现在输出里。
+        // 注意必须在 split 之后的行数组上比，比原文会被行尾归一化误报。
+        //
+        // 上面两条就地命中的 edit 是**契约允许**的改行（「只替换 = 右侧，左半部分原样保留」），
+        // 所以超序列要比的是「已应用就地替换后的输入行」。直接拿原始 Sample 的行去比是恒假的：
+        // Dx12Upscaler=auto 本来就不应该出现在输出里。这里把预期改动显式写成映射，
+        // 于是断言仍然要求：左侧原样保留、其余每一行逐字原样且顺序不变。
+        var survivingInputLines = Sample
+            .Split("\r\n")
+            .Select(l => l switch
+            {
+                "Dx12Upscaler=auto" => "Dx12Upscaler=ffx",
+                "LogToFile=auto" => "LogToFile=true",
+                _ => l,
+            })
+            .ToArray();
+
+        AssertIsSupersequence(survivingInputLines, outputLines);
     }
 
     [Fact]
     public void All_comment_lines_survive_verbatim()
     {
         var patcher = new IniPatcher();
-        var originalComments = Sample.Split("\r\n").Where(l => l.StartsWith(';')).ToArray();
+        var originalComments = Sample.Split("\r\n").Where(IsComment).ToArray();
 
         var result = patcher.Patch(Sample, new[]
         {
@@ -1467,11 +1509,15 @@ public class IniPatcherTests
             Edit("Log", "LogLevel", "2"),
         });
 
-        var outputLines = result.Content.Split(result.DetectedNewLine);
-        foreach (var comment in originalComments)
-        {
-            Assert.Contains(comment, outputLines);
-        }
+        var outputComments = result.Content
+            .Split(result.DetectedNewLine)
+            .Where(l => IsComment(l) && l != "; added by OptiScaler Deployer")
+            .ToArray();
+
+        // 有序 + 带重数的比对。旧写法 Assert.Contains(comment, outputLines) 是**集合包含**：
+        // 真 OptiScaler.ini 里 `; ----` 横幅重复了几十次（L1/L3/L19/L21 完全相同），
+        // 删掉其中三条只要还剩一条相同的就照样绿。排掉 AddedByDeployer 是因为它是新增的注释。
+        Assert.Equal(originalComments, outputComments);
     }
 
     [Fact]
@@ -1491,11 +1537,16 @@ public class IniPatcherTests
     {
         var patcher = new IniPatcher();
 
-        var result = patcher.Patch(Sample, new[] { Edit("Log", "SingleFile", "true") });
+        // OldValue 故意传一个非 null 的脏值：追加项的 OldValue 必须由 patcher 清成 null，
+        // 否则拿上一轮 patch 过的 edits 再 patch 一次时，UI 会渲染出一个根本不存在的
+        // 「旧值 → 新值」diff。用 Edit() helper（它传 null）测不出这件事——那测的是 helper。
+        var stale = new IniEdit("Log", "SingleFile", "stale-from-a-previous-run", "true");
 
-        var logIndex = result.Content.IndexOf("[Log]", StringComparison.Ordinal);
-        var appendedIndex = result.Content.IndexOf("SingleFile=true", StringComparison.Ordinal);
-        Assert.True(appendedIndex > logIndex);
+        var result = patcher.Patch(Sample, new[] { stale });
+
+        // 精确全文断言：[Log] 是 Sample 的最后一个 section，追加必须落在 LogLevel 之后、
+        // 也就是文件末尾。只断言「在 [Log] 之后」区分不出「落在段末」与「落在下一个 section 里」。
+        Assert.Equal(Sample + "SingleFile=true\r\n", result.Content);
         Assert.Single(result.AppendedEdits);
         Assert.Null(result.AppendedEdits[0].OldValue);
     }
@@ -1543,6 +1594,25 @@ public class IniPatcherTests
 
         Assert.Equal("[Upscalers]\r\nDx12Upscaler=auto\r\nNewKey=1\r\n\r\n[Log]\r\nLogToFile=auto\r\n",
             result.Content);
+    }
+
+    [Fact]
+    public void Appends_into_two_different_existing_sections_both_land_at_their_own_section_end()
+    {
+        // 这是 Critical 缺陷的回归看守：插入使**后半部分所有 section** 的锚点过期，
+        // 只更新当前 section 会让后一个 section 的新键落到它的 section 头之前，
+        // 也就是写进上一个 section。既有的追加测试全都只碰一个 section，盖不到。
+        const string ini = "[A]\r\nA1=1\r\n\r\n[B]\r\nB1=1\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[]
+        {
+            Edit("A", "X1", "1"),
+            Edit("A", "X2", "2"),
+            Edit("B", "Y", "9"),
+        });
+
+        Assert.Equal("[A]\r\nA1=1\r\nX1=1\r\nX2=2\r\n\r\n[B]\r\nB1=1\r\nY=9\r\n", result.Content);
     }
 
     [Fact]
@@ -1632,6 +1702,21 @@ public class IniPatcherTests
     }
 
     [Fact]
+    public void Section_and_key_with_surrounding_whitespace_are_trimmed_instead_of_creating_a_duplicate_section()
+    {
+        // " Log " 匹配不上文件里的 "Log"，旧行为会往文件末尾追加一个字面的 [ Log ] 段，
+        // 而 INI 解析器读它时 trim 内侧空格得到 Log —— 游戏文件里于是出现两个同名 section。
+        const string ini = "[Log]\r\nLogToFile=auto\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit(" Log ", " LogToFile ", "true") });
+
+        Assert.Equal("[Log]\r\nLogToFile=true\r\n", result.Content);
+        Assert.Single(result.AppliedEdits);
+        Assert.Empty(result.AppendedEdits);
+    }
+
+    [Fact]
     public void Mixed_line_endings_still_get_patched_instead_of_silently_skipping()
     {
         // 第 2 行以 bare LF 结尾。改之前这条 edit 会静默不生效：
@@ -1677,6 +1762,72 @@ public class IniPatcherTests
         Assert.True(iZzz >= 0 && iZzz < iAaa && iAaa < iMmm,
             $"追加顺序应为 Zzz、Aaa、Mmm（实际下标 {iZzz}, {iAaa}, {iMmm}）");
     }
+
+    [Fact]
+    public void Section_header_with_trailing_inline_comment_is_still_recognised()
+    {
+        // `[B] ; note` 是合法 INI 写法。不认它的话 currentSection 会停留在 A，
+        // 于是针对 A/K 的 edit 会改到物理上位于 B 段的那个 K——改错 section，静默。
+        const string ini = "[A]\r\nX=1\r\n[B] ; note\r\nK=2\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "K", "9") });
+
+        // A 段没有 K，所以应当**追加**到 A 段末尾，B 段的 K=2 一个字符都不能动
+        Assert.Equal("[A]\r\nX=1\r\nK=9\r\n[B] ; note\r\nK=2\r\n", result.Content);
+        Assert.Single(result.AppendedEdits);
+        Assert.Empty(result.AppliedEdits);
+    }
+
+    [Fact]
+    public void Line_starting_with_bracket_but_without_closing_bracket_is_skipped_entirely()
+    {
+        // `[Foo=bar` 不是 section 头。旧行为会把它当成键名 `[Foo` 解析，
+        // 那是在往游戏文件里制造一个谁也不认识的键。
+        // 第二条 edit 的 Key 故意取成 `[Broken`——正好等于那条畸形行 `=` 的左侧：
+        // 只有这样才能观察到「整行跳过」与「掉进键解析」的区别。对任何正常 Key
+        // 而言两者结果相同（畸形行匹配不上就被静默忽略），所以只靠一条普通 edit 钉不住这个分支。
+        const string ini = "[A]\r\nK=1\r\n[Broken=bar\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "K", "9"), Edit("A", "[Broken", "9") });
+
+        // `[Broken=bar` 一个字符都不能动；`[Broken` 在 A 段不是键，所以走追加，落在段末
+        Assert.Equal("[A]\r\nK=9\r\n[Broken=bar\r\n[Broken=9\r\n", result.Content);
+        Assert.Single(result.AppliedEdits);
+        Assert.Single(result.AppendedEdits);
+    }
+
+    [Fact]
+    public void Hash_comment_lines_are_never_parsed_as_keys()
+    {
+        // Sample 常量里没有 # 注释行，所以 All_comment_lines_survive_verbatim 单靠它盖不到 # 分支。
+        // 这里用一个 Key 字面上等于 # 注释行 `=` 左侧的 edit 来钉住：# 行必须整行当注释跳过，
+        // 绝不参与键解析。少了 `|| trimmed.StartsWith('#')` 的话实现会去改写这条注释，
+        // 而 IIniPatcher 承诺「所有以 ; 或 # 开头的行原样保留」。
+        const string ini = "[A]\r\n#Legacy=1\r\nK=2\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "#Legacy", "9") });
+
+        // 注释行一个字符都不能动；#Legacy 在 A 段不是键，所以走追加，落在段末
+        Assert.Equal("[A]\r\n#Legacy=1\r\nK=2\r\n#Legacy=9\r\n", result.Content);
+        Assert.Empty(result.AppliedEdits);
+        Assert.Single(result.AppendedEdits);
+    }
+
+    [Fact]
+    public void Input_without_trailing_newline_gains_one_when_edits_are_applied()
+    {
+        // 已知且**有意**的行为：edits 非空时 Join 会给不以换行结尾的输入补一个尾换行。
+        // 钉住它是为了防止后来者把这当 bug「修」掉——空 edits 走早返回分支，不补。
+        const string ini = "[A]\r\nK=1";       // 注意：不以换行结尾
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("A", "K", "2") });
+
+        Assert.Equal("[A]\r\nK=2\r\n", result.Content);
+    }
 }
 ```
 
@@ -1711,12 +1862,27 @@ public sealed class IniPatcher : IIniPatcher
 
     public IniPatchResult Patch(string originalContent, IReadOnlyList<IniEdit> edits)
     {
+        // 用户手写 profile JSON 时很容易在 Section / Key 前后多打空格（" Log "）。不归一化的话
+        // 它匹配不上文件里的 "Log"，会掉进「新建 section」分支往文件末尾追加一个字面的
+        // `[ Log ]` 段——而 INI 解析器读它时会 trim 内侧空格得到 Log，于是游戏文件里出现两个
+        // 同名 section、值互相冲突。这里选择 Trim 而不是拒绝：意图是明确的、错误是可恢复的，
+        // 不该让整次部署失败。归一化后的 edits 也会原样出现在返回的 AppliedEdits / AppendedEdits 里。
+        var normalizedEdits = new List<IniEdit>(edits.Count);
+        foreach (var edit in edits)
+        {
+            normalizedEdits.Add(edit with
+            {
+                Section = edit.Section?.Trim() ?? string.Empty,
+                Key = edit.Key?.Trim() ?? string.Empty,
+            });
+        }
+
         // 空 Section / 空 Key 是**硬错误**，不是「匹配不上就算了」：Section 为空会命中
         // 第一个 section 头之前的前言区，Key 为空会命中任何以 = 开头的畸形行；两者都
         // 会让「新建 section」分支往用户的 OptiScaler.ini 末尾追加一个 [] 段——那是往
         // 游戏文件里写垃圾。守卫放在这一层而不是调用方：IniPatcher 是真正落笔的地方，
         // 而 edits 可能来自用户自己写的 profile JSON。
-        foreach (var edit in edits)
+        foreach (var edit in normalizedEdits)
         {
             if (string.IsNullOrWhiteSpace(edit.Section) || string.IsNullOrWhiteSpace(edit.Key))
             {
@@ -1729,7 +1895,7 @@ public sealed class IniPatcher : IIniPatcher
         var newLine = DetectNewLine(originalContent);
         var lines = SplitLines(originalContent);
 
-        if (edits.Count == 0)
+        if (normalizedEdits.Count == 0)
         {
             return new IniPatchResult(originalContent, Array.Empty<IniEdit>(), Array.Empty<IniEdit>(), newLine);
         }
@@ -1739,7 +1905,7 @@ public sealed class IniPatcher : IIniPatcher
         // 规范保证（.NET 8 实测幸存键的相对顺序不变，但那是实现细节、不是契约）。
         var pending = new Dictionary<(string Section, string Key), IniEdit>(KeyComparer.Instance);
         var orderedKeys = new List<(string Section, string Key)>();
-        foreach (var edit in edits)
+        foreach (var edit in normalizedEdits)
         {
             var key = (edit.Section, edit.Key);
             if (!pending.ContainsKey(key))
@@ -1751,7 +1917,7 @@ public sealed class IniPatcher : IIniPatcher
         }
 
         var applied = new List<IniEdit>();
-        var sectionLastLineIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var sectionAppendAnchor = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var currentSection = string.Empty;
 
         for (var i = 0; i < lines.Count; i++)
@@ -1764,14 +1930,19 @@ public sealed class IniPatcher : IIniPatcher
                 continue;   // 注释行：原样保留，绝不参与解析
             }
 
-            if (trimmed.StartsWith('[') && trimmed.TrimEnd().EndsWith(']'))
+            if (trimmed.StartsWith('['))
             {
-                if (currentSection.Length > 0)
+                // 以 [ 开头的行一律不当作键解析：要么是 section 头，要么整行跳过。
+                if (TryReadSectionHeader(trimmed, out var sectionName))
                 {
-                    sectionLastLineIndex[currentSection] = LastContentLineIndex(lines, i - 1);
+                    if (currentSection.Length > 0)
+                    {
+                        sectionAppendAnchor[currentSection] = LastContentLineIndex(lines, i - 1);
+                    }
+
+                    currentSection = sectionName;
                 }
 
-                currentSection = trimmed.TrimEnd()[1..^1].Trim();
                 continue;
             }
 
@@ -1794,7 +1965,7 @@ public sealed class IniPatcher : IIniPatcher
 
         if (currentSection.Length > 0)
         {
-            sectionLastLineIndex[currentSection] = LastContentLineIndex(lines, lines.Count - 1);
+            sectionAppendAnchor[currentSection] = LastContentLineIndex(lines, lines.Count - 1);
         }
 
         var appended = new List<IniEdit>();
@@ -1807,11 +1978,24 @@ public sealed class IniPatcher : IIniPatcher
                 continue;   // 已在上面就地替换过
             }
 
-            if (sectionLastLineIndex.TryGetValue(edit.Section, out var insertAt) && insertAt >= 0)
+            if (sectionAppendAnchor.TryGetValue(edit.Section, out var anchorLine) && anchorLine >= 0)
             {
-                lines.Insert(insertAt + 1, edit.Key + "=" + edit.NewValue);
-                // 插入点下移一行，同一 section 的下一条接着排在它后面
-                sectionLastLineIndex[edit.Section] = insertAt + 1;
+                lines.Insert(anchorLine + 1, edit.Key + "=" + edit.NewValue);
+
+                // 插入使插入点之后的所有行整体下移一行，因此**每一个**指向后半部分的锚点都过期了。
+                // 只更新当前 section 会让后面 section 的锚点偏差，偏差累积到超过该 section 的长度时，
+                // 新键会落到 section 头之前——也就是写进上一个 section，直接击穿 section 作用域这条
+                // 不变量。section 总数最多几十个，整体扫一遍的代价可以忽略。
+                foreach (var pair in sectionAppendAnchor.ToArray())
+                {
+                    if (pair.Value >= anchorLine + 1)
+                    {
+                        sectionAppendAnchor[pair.Key] = pair.Value + 1;
+                    }
+                }
+
+                // 当前 section 的锚点推到刚插入的那一行，同 section 的下一条接着排在它后面
+                sectionAppendAnchor[edit.Section] = anchorLine + 1;
             }
             else
             {
@@ -1827,16 +2011,51 @@ public sealed class IniPatcher : IIniPatcher
                 }
 
                 lines.Add(edit.Key + "=" + edit.NewValue);
-                sectionLastLineIndex[edit.Section] = lines.Count - 1;
+                sectionAppendAnchor[edit.Section] = lines.Count - 1;
             }
 
-            appended.Add(edit);
+            appended.Add(edit.WithOldValue(null));
         }
 
         return new IniPatchResult(Join(lines, newLine), applied, appended, newLine);
     }
 
-    /// <summary>从 <paramref name="from"/> 往前找最后一个非空行。避免把新键插在 section 末尾的空行之后。</summary>
+    /// <summary>
+    /// 识别 section 头：以 [ 开头、扫到**第一个** ] 为止，] 之后的内容（行内注释）一律忽略，
+    /// 内侧空白 trim 掉。没有 ] 就返回 false，整行由调用方跳过。
+    /// </summary>
+    /// <remarks>
+    /// 为什么 `]` 后面允许有内容：`[Log] ; 只写日志` 是完全合法的 INI 写法，通行解析器都认。
+    /// 要求 `]` 必须在行尾会让这一行既不是 section 头、又没有 `=`，于是被当成空行跳过——
+    /// currentSection 保持不变，后面所有键被归到**上一个** section 名下。失效方向是
+    /// 「改到别的 section 的键」与「往文件末尾追加一个重复 section」，两者都是静默的。
+    /// 为什么没有 `]` 时整行跳过而不是当键解析：`[Foo=bar` 会被解析成键名 `[Foo`，
+    /// 那是在往游戏文件里制造一个谁也不认识的键。
+    /// </remarks>
+    private static bool TryReadSectionHeader(string trimmedLine, out string sectionName)
+    {
+        sectionName = string.Empty;
+
+        var close = trimmedLine.IndexOf(']');
+        if (close < 0)
+        {
+            return false;
+        }
+
+        sectionName = trimmedLine[1..close].Trim();
+        return true;
+    }
+
+    /// <summary>
+    /// 从 <paramref name="from"/> 往前找最后一个非空白行，作为该 section 的追加锚点。
+    /// </summary>
+    /// <remarks>
+    /// 注意**注释行算内容**：真 OptiScaler.ini 里很多 section 末尾有 `; ----` 横幅，
+    /// 新键会落在横幅**之后**而不是紧贴最后一个真实键。这是有意的——横幅在语义上属于
+    /// 它上面那个 section 的收尾，把新键插在横幅与它描述的键之间才是真的拆散了注释。
+    /// 全是空白行时返回 -1；调用处那个 `>= 0` 判断在当前所有路径下恒为真（三个写入点
+    /// 都保证了非负），留着是防将来有人新增一个可能写入 -1 的路径。
+    /// </remarks>
     private static int LastContentLineIndex(List<string> lines, int from)
     {
         while (from >= 0 && lines[from].Trim().Length == 0)
@@ -1905,22 +2124,36 @@ public sealed class IniPatcher : IIniPatcher
 
 **关于「`orderedKeys` 杀不死变异」**：把 `foreach (var key in orderedKeys)` 改成 `foreach (var key in pending.Keys.ToList())`，全部测试依旧绿——这**不是覆盖缺口，是等价变异体**。.NET 8 的 `Dictionary.Remove` 只把槽位标记为空闲并挂进 freeList，**不压缩** `_entries` 数组；`KeyCollection` 枚举器按下标 `0.._count` 线性扫并跳过已释放的槽，所以删除之后**幸存键的相对顺序不变**。本实现又只在最初那一个 `foreach` 里往 `pending` 加键（之后再无 Add），freeList 复用无从发生，两者逐输入行为相同。`orderedKeys` 仍然要留：它把「顺序 = 首次出现顺序」这个意图写成**结构**，而不是寄望于运行时实现细节；哪天有人改成边扫边 Add、或者换个容器，寄望就会失效。`Appended_keys_keep_edit_order_even_when_other_edits_matched_in_place` 钉住的是可观察契约（混合命中与追加时的顺序），它杀不死上面那个等价变异体，但契约真被破坏时会变红。**别因为「变异没被杀死」就去删 `orderedKeys` 或那条测试。**
 
-**为什么正序插入而不用 `Reverse()`**：每插入一行就把 `sectionLastLineIndex[section]` 推到新行的位置，下一条自然排在它后面——正序遍历直接得到正确结果，逆序反而会颠倒。
+**为什么正序插入而不用 `Reverse()`**：每插入一行就把 `sectionAppendAnchor[section]` 推到新行的位置，下一条自然排在它后面——正序遍历直接得到正确结果，逆序反而会颠倒。
 
-**`LastContentLineIndex` 存在的理由**：若直接用「下一个 section 头的前一行」作为插入点，而那一行是分隔用的空行，新键就会落在空行之后、与 section 本体隔开。功能上仍正确（还在同一个 section 里），但人读起来像是另一个区块。
+**插入之后必须把插入点之后所有 section 的锚点整体前移一行**：`sectionAppendAnchor` 里的下标是扫描阶段对着**未修改**的 `lines` 记下来的，而追加阶段用 `lines.Insert(anchorLine + 1, …)` 改的是同一个列表。插入使插入点之后的每一行都下移一行，所以**每一个** `>= anchorLine + 1` 的锚点都过期了，不只是当前 section 的那一个。只更新当前 section 的话，后面所有 section 的锚点各偏差 1，偏差还会随追加次数累积：偏差 ≥ 1 时新键不再落在 section 末尾，还可能插进一个注释块与它所解释的键之间把两者拆散（在一份 55% 是注释的文件里这是用户可见的退化）；偏差累积到超过该 section 的长度时，新键会落到 section 头**之前**，也就是写进了上一个 section——直接击穿类头 `<remarks>` 第 2 条声称的 section 作用域硬性要求。实测：输入 `[Upscalers]\r\nDx12Upscaler=auto\r\n\r\n[FrameGen]\r\nEnabled=auto\r\n` + edits `(Upscalers,New1,1) (Upscalers,New2,2) (FrameGen,New3,3)`，`New3=3` 会跑到 `[FrameGen]` 头之前、也就是写进了 `[Upscalers]`。实现上必须先 `sectionAppendAnchor.ToArray()` 拿快照再遍历：`Dictionary` 的枚举器会校验 `_version`，而索引器赋值会递增它，边枚举边写会抛 `InvalidOperationException`。section 总数最多几十个，整体扫一遍的代价可以忽略。「新建 section」分支走的是 `lines.Add(...)`，往列表末尾追加不会让任何既有锚点失效，所以**不需要**这个处理。回归看守是 `Appends_into_two_different_existing_sections_both_land_at_their_own_section_end`（既有的追加测试全都只碰一个 section，盖不到）。
+
+**`LastContentLineIndex` 存在的理由**：若直接用「下一个 section 头的前一行」作为插入点，而那一行是分隔用的空行，新键就会落在空行之后、与 section 本体隔开。功能上仍正确（还在同一个 section 里），但人读起来像是另一个区块。注意它只跳**纯空白行**，`; ----` 这样的注释横幅算内容、会成为锚点，所以新键落在横幅**之后**——这是有意的，横幅在语义上属于它上面那个 section 的收尾，把新键插在横幅与它描述的键之间才是真的拆散了注释。它在全是空白行时返回 `-1`，而调用处那个 `anchorLine >= 0` 判断在当前所有路径下恒为真（三个写入点都保证了非负），是一段死防御，留着只为防将来新增一个可能写入 `-1` 的路径。
+
+**section 头怎么解析**：判定抽在私有方法 `TryReadSectionHeader` 里，规则与通行 INI 解析器对齐——以 `[` 开头、扫到**第一个** `]` 为止，`]` 之后的内容（行内注释）一律忽略，内侧空白 trim 掉；没有 `]` 就返回 `false`，整行由调用方跳过。
+
+为什么 `]` 之后允许有内容：`[Log] ; 只写日志` 是完全合法的 INI 写法。旧判定 `trimmed.StartsWith('[') && trimmed.TrimEnd().EndsWith(']')` 要求 `]` 必须在行尾，于是这一行既不是 section 头、又没有 `=`，被当成空行跳过——`currentSection` 保持不变，后面所有键被归到**上一个** section 名下。两个后果都是静默的：其一，针对 `A` 段的 edit 会改到物理上位于 `B` 段的那个同名键（实测 `[A]\r\nX=1\r\n[B] ; note\r\nK=2\r\n` + edit `(A,K,"9")` 会把 `B` 段的 `K=2` 改成 `K=9`）；其二，针对 `B` 段的 edit 匹配不上，于是往文件末尾追加出**第二个** `[B]` 段。可达性：仓库根的真 `OptiScaler.ini` 37 个 section 头全部干净，但被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 含 `manualDirectory`——用户可以指定任意本地目录作为 payload。
+
+为什么没有 `]` 时整行跳过而不是当键解析：`[Foo=bar` 会被 `IndexOf('=')` 解析成键名 `[Foo`，那是在往游戏文件里制造一个谁也不认识的键。这是一处**有意的行为改变**（旧实现会当键解析）。其余分支与旧实现逐一核对过等价：`[ Section ]` → trim 后 `Section`；`[]` → 空 section 名；`[Sec[tion]` → 取第一个 `]`，得 `Sec[tion`（旧的 `[1..^1]` 对同一输入也得 `Sec[tion`）。
 
 **为什么空 Section / 空 Key 是硬错误而不是「匹配不上就跳过」**：`currentSection` 初值是 `string.Empty`，一条 Section 为空白的 edit 会静默命中第一个 section 头之前的前言区；若没命中，就落进「新建 section」分支，往用户的 `OptiScaler.ini` 末尾追加一个 `[]` 段——那是往游戏文件里写垃圾，直接违背「绝不损坏游戏文件」这条第一承诺。Key 为空白同理，会命中任何以 `=` 开头的畸形行。失效方向是**静默写入垃圾**，所以必须抛 `ArgumentException` 而不是当作未命中。守卫放在 `IniPatcher` 而非调用方：它是真正落笔改游戏文件的那一层，而 edits 可能来自用户自己写的 profile JSON（Task 5 的 `JsonProfileStore` 从磁盘读），放在这最后一道关口才能同时覆盖 builtins、用户 JSON 与任何未来的调用方；Task 9 的 `BuildIniEdits` 因此不再重复校验。
 
-**为什么 `SplitLines` 改成按 `\n` 切再剥掉行尾 `\r`**：若按检测到的主导 `newLine` 切，一个以 CRLF 为主、却夹了几行 bare LF 的文件（用户拿 Unix 编辑器手改过就会这样），那几行会被并进相邻的同一个「行」字符串里。例如 `[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n` 会被切成 `["[Upscalers]", "Foo=1\nDx12Upscaler=auto"]`，于是针对 `Dx12Upscaler` 的 edit 实际匹配到的是 `Foo`。失效方向是**静默漏改**：`Join` 能原样还原所以文件不会被写坏，但「配置改了却没生效」是最难排查的一类失败。代价是输出会把零星 bare LF 归一化成主导行尾——这是对「最小干预」的一次有意识让步，换取的是「不会静默漏改」。仓库根目录的真 `OptiScaler.ini` 实测 `crlf=1571 bareLf=0`，当前无此风险，但用户手改过的 INI 不保证；纯 CRLF 与纯 LF 两种文件在改动前后行为完全一致（加固改动前的既有测试全部保持绿）。
+**为什么先 Trim 归一化 Section / Key，而空白仍然抛**：守卫循环之前先把每条 edit 的 `Section` / `Key` 各自 `Trim()` 一遍，之后所有逻辑（守卫、`pending`、`orderedKeys`）都用归一化后的列表，返回的 `AppliedEdits` / `AppendedEdits` 里也是归一化后的值。不归一化的话 `" Log "` 能通过 `IsNullOrWhiteSpace` 守卫，却匹配不上扫描期从文件读出的 `"Log"`（`OrdinalIgnoreCase` 救不了空格差异），于是掉进「新建 section」分支往文件末尾追加一个字面的 `[ Log ]` 段——而 INI 解析器读 `[ Log ]` 时会 trim 内侧空格得到 `Log`，游戏文件里于是出现**两个同名 section**、值互相冲突。这与上面那段守卫点名要防的事（往 ini 末尾追加一个 `[]` 段）是同一个失效模式，只是入口从「空白」换成了「前后带空白」；只拦空白等于守卫只挡了一半，「同时覆盖 builtins、用户 JSON 与任何未来的调用方」那句也就不成立。
+
+为什么这里选 Trim 而空白仍然抛 `ArgumentException`：两者防的是不同的东西。前后多打空格是**意图明确、错误可恢复**的——用户想改的就是 `Log` 段，Trim 之后的行为正是他想要的，不该让整次部署失败；而 Section / Key 全空白是**意图不可恢复**的，无从猜测用户想改哪个段哪个键，只能报错让他改 profile。注意 `Blank_key_is_rejected` 传的 `"   "` 经 Trim 后变成 `""`，仍会被守卫拒绝，那条测试继续通过。
+
+**为什么 `SplitLines` 改成按 `\n` 切再剥掉行尾 `\r`**：若按检测到的主导 `newLine` 切，一个以 CRLF 为主、却夹了几行 bare LF 的文件，那几行会被并进相邻的同一个「行」字符串里。例如 `[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n` 会被切成 `["[Upscalers]", "Foo=1\nDx12Upscaler=auto"]`，于是针对 `Dx12Upscaler` 的 edit 实际匹配到的是 `Foo`。失效方向是**静默漏改**：`Join` 能原样还原所以文件不会被写坏，但「配置改了却没生效」是最难排查的一类失败。代价是输出会把零星 bare LF 归一化成主导行尾——这是对「最小干预」的一次有意识让步，换取的是「不会静默漏改」。仓库根目录的真 `OptiScaler.ini` 实测 `crlf=1571 bareLf=0`，但**这不能推广到实际被 patch 的那份文件**：被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 枚举含 `manualDirectory`——用户可以指定任意本地目录作为 payload，那份 ini 可能来自任何地方（被用户手改过、从别的机器拷来、被某个编辑器重存过）；而且不同 OptiScaler 版本的 ini 行尾也不保证一致。加固本身仍然正确，只是威胁模型要说准，不能窄化成「用户拿 Unix 编辑器手改过」这一条路径；纯 CRLF 与纯 LF 两种文件在改动前后行为完全一致（加固改动前的既有测试全部保持绿）。
 
 **这条 `ArgumentException` 在下游怎么呈现**：它从 `IniPatcher.Patch` 抛出，穿过纯函数 planner、executor，最终由 Task 15 CLI 顶层那句 `return Fail(ex.Message, ex)` 打到 stderr——消息里带着 `Section=""`/`Key=""` 的实际值，正好是用户手改 profile JSON 时定位错误所需的线索，所以**不需要**再包一层 `DeployerException`（包了只会把这条线索换成一句更泛的话术）。计划 C 的 WPF UI 需遵守同一条：把这个异常的消息原文呈现给用户，而不是显示成「未知错误」。
 
-**`SplitLines` 会补一个尾换行**：若输入不以换行结尾，`Join` 后输出会多一个（例如 `"[A]\nK=1"` → `"[A]\nK=1\n"`）。这对 INI 无害（OptiScaler 的 SimpleIni 不关心），但计划 B 写「真 INI 回归测试」时必须明确断言口径：要么断言 `Patch(真文件)` 的输出以换行结尾，要么先确认真文件本来就以换行结尾（实测 1571 行 CRLF，是）。别把这条当成 bug 去「修」。
+**`SplitLines` 会补一个尾换行**：若输入不以换行结尾，`Join` 后输出会多一个（例如 `"[A]\nK=1"` → `"[A]\nK=1\n"`）。这对 INI 无害（OptiScaler 的 SimpleIni 不关心），但计划 B 写「真 INI 回归测试」时必须明确断言口径：要么断言 `Patch(真文件)` 的输出以换行结尾，要么先确认真文件本来就以换行结尾（实测 1571 行 CRLF，是）。别把这条当成 bug 去「修」。这条已知行为已由 `Input_without_trailing_newline_gains_one_when_edits_are_applied` 钉住（空 edits 走早返回分支，不补）。
+
+**匹配到的键行，其 `=` 右侧的行尾注释会被一并替换掉**：`K=1 ; keep me` 被改成 `K=9`，`; keep me` 消失。这在契约上不算违约（`IIniPatcher` 承诺的是「所有**以** `;` 或 `#` **开头**的行原样保留」，行尾注释不在承诺范围内），且真 payload ini 实测零行内注释，故当前不可达。**不做保留是有意的**：通行 INI 解析器很可能把值后面的 `;` 视为值的一部分，拼回去会让 OptiScaler 读到 `"9 ; keep me"` 而解析失败——那比丢一条注释严重得多，失效方向更糟。（`external/simpleini` 是未初始化的子模块，本地无源码可查证，所以这里不凭猜测改行为。）
 
 - [x] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter IniPatcherTests`
-Expected: `失败: 0，通过: 17`
+Expected: `失败: 0，通过: 23`
 
 - [x] **Step 6: 用真 INI 做一次人工核对**
 
