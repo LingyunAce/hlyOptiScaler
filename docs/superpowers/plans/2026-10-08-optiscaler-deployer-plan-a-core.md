@@ -2382,6 +2382,9 @@ public class BuiltinProfilesTests
 
         Assert.Equal("dlssg",
             edits.Single(e => e.Section == "FrameGen" && e.Key == "FGInput").NewValue);
+        // dlssg 输入原生支持 Hudless（真 ini L28），不需要 HUDFix；而 HUDFix 自带崩溃风险
+        // （L317 "Might cause crashes, especially with Async"），所以这条路径上不应出现它。
+        Assert.DoesNotContain(edits, e => e.Section == "OptiFG" && e.Key == "HUDFix");
     }
 
     [Fact]
@@ -2488,8 +2491,9 @@ public static class BuiltinProfiles
     public static IReadOnlyList<UpscalerProfile> All { get; } = new[] { AmdRdna4, AmdRdna4Native, NvidiaRtx };
 
     /// <summary>
-    /// 帧生成附加档。用户勾选后才叠加到基础 Profile 之上，绝不默认开启。
-    /// HUDFix 必须开：帧生成场景下 HUD 会产生鬼影（spec §1 的 OptiScaler 能力清单）。
+    /// 帧生成附加档。用户勾选后才叠加到基础 Profile 之上，一律不默认开启。
+    /// HUDFix 只在 FGInput=upscaler 时开：那条路径下它是必需的（防 UI 鬼影），
+    /// 而 dlssg 输入原生支持 Hudless，开它只增加崩溃风险。依据见方法体注释。
     /// </summary>
     public static IReadOnlyList<IniEdit> FrameGenAddOn(bool useStreamlineInput)
     {
@@ -2499,19 +2503,38 @@ public static class BuiltinProfiles
             new("FrameGen", "FGInput", null, useStreamlineInput ? "dlssg" : "upscaler"),
             new("FrameGen", "FGOutput", null, "fsrfg"),
             new("FSR", "FGIndex", null, "0"),
-            new("OptiFG", "HUDFix", null, "true"),
         };
+
+        // HUDFix 只在 FGInput=upscaler 时才是必需的，而它自带崩溃风险，所以按输入分支决定加不加。
+        // 依据是真 OptiScaler.ini 的上游注释（实测行号）：L31 说 upscaler 输入
+        // "To prevent UI glitching, Hudfix is required"；L28 说 dlssg 输入
+        // "Supports Hudless out of the box"（不需要它）；L317 警告 HUDFix
+        // "Might cause crashes, especially with Async"。
+        // 在不需要它的路径上开它 = 纯增崩溃风险、零收益，与本项目「部署后健康检查回滚」的
+        // 安全模型直接冲突（触发的是回滚，用户看到的是「装了又自己卸了」）。
+        if (!useStreamlineInput)
+        {
+            edits.Add(new IniEdit("OptiFG", "HUDFix", null, "true"));
+        }
 
         return edits;
     }
 }
 ```
 
-注意 `[OptiFG] HUDFix` 这个键名要在计划 D 之前对着真 `OptiScaler.ini` 核一遍（该 section 有 22 个 HUDFix 相关键）。若键名不符，`IniPatcher` 的行为是**追加**而非报错，游戏里表现为「该项不生效」而不是崩溃——这正是 spec §13 列的上游键名变动缓解措施。核对命令：
+**本 Task 引用的全部 12 个 (section, key) 与它们的值已逐个对着上游注释核过（控制器在实施前实测）**。键名与行号：`Upscalers.Dx11Upscaler`(L6) / `Dx12Upscaler`(L11) / `VulkanUpscaler`(L15)、`FSR.UpscalerIndex`(L572) / `FGIndex`(L577) / `Fsr4ForceModel`(L621)、`Spoofing.Dxgi`(L956) / `Vulkan`(L974)、`FrameGen.Enabled`(L25) / `FGInput`(L34) / `FGOutput`(L41)、`OptiFG.HUDFix`(L319)。值域全部合法，依据是每个键上方的上游注释：`Dx11Upscaler` 取 `fsr22, fsr31, xess, xess_12, fsr21_12, fsr22_12, ffx_12, dlss`(L5)、`Dx12Upscaler` 取 `xess, fsr21, fsr22, ffx, dlss`(L9)、`VulkanUpscaler` 取 `fsr21, fsr22, ffx, xess, fsr21_12, ffx_12, dlss`(L14)、`FGInput` 取 `nofg, dlssg, nvngxfg, fsrfg, upscaler, fsrfg30`(L33)、`FGOutput` 取 `nofg, fsrfg, xefg, dlssg`(L40)，余下均为 `true or false` 或整数枚举。关于旧版本这里写的「该 section 有 22 个 HUDFix 相关键」：实测对不上任何口径——`[OptiFG]`（头在 L307）共 **27** 个键，其中键名含 `hudfix`（不分大小写）的有 **16** 个，全文件含 `hudfix` 的行（含注释）是 **23** 行。`HUDFix` 本身精确存于 **L319**。
+
+**为什么 `UpscalerIndex=0` / `FGIndex=0` / `Fsr4ForceModel=0` / `Spoofing.Vulkan=false` 在 RDNA4 上与 `auto` 等效却仍要钉死**：实测上游注释 L571「Default (auto) is 0 - **FSR4 for RDNA4**, FSR3 for the rest」、L576 同、L620「From 0 to 2 - Default (auto) is 0」、L973「Default (auto) is false」——在 9070 XT 上这四个键写 `auto` 得到的就是同样的值。钉死它们的理由**不是**「auto 会选错」，而是**归一化**：被 patch 的 ini 可能来自 `PayloadOrigin.ManualDirectory` 指向的任意目录、也可能被用户手改过，而 `IniPatcher` 是**改写既有键**——profile 不写它就保持用户留下的值。L618 明确警告过这个坑：「Don't fool yourself when trying to force FP8 on actually unsupported GPUs, driver has a FSR 3 fallback」，即手改留下的 `Fsr4ForceModel=1` 会静默降级而不报错。**别按「最小干预」把这几个键当冗余删掉**：最小干预约束的是「不去动与本档无关的键」，不是「不去纠正与本档直接相关的键」。
+
+**为什么 `Spoofing.Dxgi=false` 是有意的行为改变**：L955 实测「Default (auto) is **true for AMD/Intel**, false for Nvidia」，所以在 9070 XT 上 `auto` 等于 `true`（会伪装成 N 卡），而本档写 `false` 与 auto **不等效**。理由是走 FSR4 不需要伪装 N 卡，关掉能少一堆兼容性问题（design.md 已记）。
+
+**已知问题（记给 Task 9 planner 与计划 C 的 UI）**：`FrameGenAddOn` 写 `FrameGen.FGOutput=fsrfg`，而 `NvidiaRtx` 基础档自己写的是 `dlssg`。两者叠加时 `IniPatcher` 的 last-one-wins（实测 `IniPatcher.cs` L60-74：`pending[key] = edit` 用索引器赋值，重复 (Section, Key) **不抛**、后出现的覆盖先出现的、顺序按首次出现保留）会让 AddOn 的 `fsrfg` 胜出。这在 N 卡上技术上可行（FSR FG 的 `amd_fidelityfx_*.dll` 不限显卡），但与基础档的声明矛盾。**现在不参数化 `FGOutput`**：`FrameGenAddOn` 当前没有任何调用方（Task 9 的 planner 才是第一个），此刻并不知道 UI 会不会允许在 `NvidiaRtx` 上勾选帧生成；信息不足时不把签名钉死。计划 C 若确定 N 卡档不提供该勾选，这条自然不可达；若提供，届时给 `FrameGenAddOn` 加一个 `fgOutput` 参数。
+
+若上游改了键名，`IniPatcher` 的行为是**追加**而非报错，游戏里表现为「该项不生效」而不是崩溃——这正是 spec §13 列的上游键名变动缓解措施。上游改版后重新核对用这个（每个键的值域注释就在它自己上方几行，行号见上表）：
 
 ```powershell
 cd "d:\AI\project\hlyOptiScaler"
-Select-String -Path OptiScaler.ini -Pattern '^\[OptiFG\]' -Context 0,40 | ForEach-Object { $_.Context.PostContext }
+$e=New-Object System.Text.UTF8Encoding($false); $L=[System.IO.File]::ReadAllText((Resolve-Path 'OptiScaler.ini'),$e) -split "`r`n"; 315..319 | ForEach-Object { "L$_`: " + $L[$_-1] }
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -2722,7 +2745,9 @@ public sealed class JsonProfileStore : IProfileStore
 - [ ] **Step 8: 跑测试**
 
 Run: `dotnet test OptiScalerDeployer.sln`
-Expected: `失败: 0，通过: 30`
+Expected: `失败: 0，通过: 73`
+
+（73 = Task 4 结束时的实测基线 **59** + `BuiltinProfilesTests` **9** + `JsonProfileStoreTests` **5**。上面 Task 3 那个 Step 写的「通过: 33」同样是偏小的推算值，实测是 59——这类累加值只供对照，闸门始终是 `失败: 0`，见本计划末尾的说明。）
 
 - [ ] **Step 9: Commit**
 
