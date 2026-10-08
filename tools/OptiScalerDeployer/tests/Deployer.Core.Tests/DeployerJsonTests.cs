@@ -68,9 +68,9 @@ public class DeployerJsonTests
     }
 
     // 这些名字是 manifest.json 与 ledger.json 的**落盘契约**：改个成员名或改拼写，
-    // 旧 manifest 就反序列化不出来；BackupStore.ReadJson 会把它吞成 null；RollbackExecutor
-    // 接着报「读不到备份 manifest，可能已损坏或被删」—— 一次纯重构就这样静默且永久地
-    // 毁掉用户的回滚能力，而报错信息还指错了方向。
+    // 旧 manifest 就反序列化不出来；BackupStore.ReadJson 会带着内层异常抛 InvalidDataException，
+    // RollbackExecutor 接着报「无法读取备份清单……原因：……」—— 一次纯重构就这样永久地
+    // 毁掉用户的回滚能力。响是响了，但那份备份已经回不来了。
     // 真要改，必须同时给 SchemaVersion 加兼容分支，并有意识地更新本测试。
     [Theory]
     [InlineData(typeof(PayloadOrigin), "localBuild", "gitHubRelease", "manualDirectory")]

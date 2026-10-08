@@ -527,7 +527,24 @@ public sealed record IniEdit(string Section, string Key, string? OldValue, strin
 /// <summary>一次文件写入。DestinationPath 为绝对路径。</summary>
 public sealed record FileWrite(string SourcePath, string DestinationPath, long Length, string Sha256);
 
-public sealed record BackupEntry(string OriginalPath, string BackupPath, BackupReason Reason);
+/// <summary>
+/// 一条影子备份。Sha256 在 planner 阶段为 null（planner 不哈希游戏自带文件——太慢，
+/// 也不是它的职责），由 BackupStore.Backup 在真正拷贝的那一刻回填。与 IniEdit.OldValue
+/// 是同一个模式：计划期不可知的值，落地期补上。
+/// </summary>
+/// <remarks>
+/// 为什么**可空**而不是 required：本 record 会进 manifest.json 长期落盘，受
+/// DeploymentManifest 的前向兼容约定管辖；且哈希在计划阶段确实不可知。
+///
+/// 为什么值得记：回滚时它是唯一的**独立**参照物。备份件在存放期间可能被磁盘错误、
+/// 杀软或云占位符水合失败改动过；没有哈希就只能盲拷回游戏目录并宣称回滚成功——
+/// 那正是本工具承诺绝不发生的事。注意这**不是**「校验它等于校验自己」：哈希是备份
+/// 当时记下的，与回滚那一刻的磁盘状态分属两个时间点，相互独立。
+/// </remarks>
+public sealed record BackupEntry(string OriginalPath, string BackupPath, BackupReason Reason, string? Sha256 = null)
+{
+    public BackupEntry WithSha256(string? sha256) => this with { Sha256 = sha256 };
+}
 
 public sealed record PlanWarning(WarningSeverity Severity, string Message);
 ```
@@ -833,7 +850,7 @@ public sealed class HealthCheckFailedException : DeployerException
 
 属性叫 `FilePath` 而不是 `Path`：`ImplicitUsings=enable` 把 `System.IO` 拉了进来，类内裸写 `Path` 会先绑定到**属性**，方法体里的 `Path.Combine(...)` 就编译不过了（Task 13 的 `DefaultPath` 也是为此才显式写 `System.IO.Path.Combine`）。这两个属性目前零消费者，是能免费改名的唯一窗口。
 
-基类把 `userMessage` 交给 `base(...)`，于是 `Exception.Message` 带的是**人话**，泛型错误处理（`catch (Exception ex) => ... ex.Message`）默认就是对的：Task 15 的 CLI 顶层那句 `return Fail(ex.Message)` 因此会把 spec §10 要求的两条出路（「用 VS2022 构建一次 OptiScaler.sln」/「手动指定产物目录」）摆到用户面前，而不是甩一串裸诊断。`Diagnostic` 仍然给日志用，并由 `ToString()` 追加回去，崩溃转储里技术细节不丢。Task 12 executor 里现有的 `ex is DeployerException de ? de.UserMessage : ...` 三元式依然正确，只是从此变成冗余。
+基类把 `userMessage` 交给 `base(...)`，于是 `Exception.Message` 带的是**人话**，泛型错误处理（`catch (Exception ex) => ... ex.Message`）默认就是对的：Task 15 的 CLI 顶层那句 `return Fail(ex.Message, ex)` 因此会把 spec §10 要求的两条出路（「用 VS2022 构建一次 OptiScaler.sln」/「手动指定产物目录」）摆到用户面前，而不是甩一串裸诊断。`Diagnostic` 仍然给日志用，并由 `ToString()` 追加回去；Task 15 的 `Fail` 会把它打到 stderr——CLI 就是日志，技术细节没有别的落点，丢了就再没人能复现现场。Task 12 executor 里的 `ex is DeployerException ? ex.Message : $"部署失败：{ex.Message}"` 不再需要 `de.UserMessage`（两者恒等），但三元式本身要保留：对外来异常还得加「部署失败：」这个前缀。
 
 - [x] **Step 2: 写 `Serialization/DeployerJson.cs`**
 
@@ -1170,9 +1187,9 @@ public class DeployerJsonTests
     }
 
     // 这些名字是 manifest.json 与 ledger.json 的**落盘契约**：改个成员名或改拼写，
-    // 旧 manifest 就反序列化不出来；BackupStore.ReadJson 会把它吞成 null；RollbackExecutor
-    // 接着报「读不到备份 manifest，可能已损坏或被删」—— 一次纯重构就这样静默且永久地
-    // 毁掉用户的回滚能力，而报错信息还指错了方向。
+    // 旧 manifest 就反序列化不出来；BackupStore.ReadJson 会带着内层异常抛 InvalidDataException，
+    // RollbackExecutor 接着报「无法读取备份清单……原因：……」—— 一次纯重构就这样永久地
+    // 毁掉用户的回滚能力。响是响了，但那份备份已经回不来了。
     // 真要改，必须同时给 SchemaVersion 加兼容分支，并有意识地更新本测试。
     [Theory]
     [InlineData(typeof(PayloadOrigin), "localBuild", "gitHubRelease", "manualDirectory")]
@@ -4733,8 +4750,14 @@ public interface IBackupStore
 
     string ProgressPathFor(string fingerprint, Guid planId);
 
-    /// <summary>把原件拷进影子目录，保持相对路径镜像。原件不存在则抛（计划已过期）。</summary>
-    void Backup(BackupEntry entry);
+    /// <summary>
+    /// 把原件拷进影子目录，保持相对路径镜像。原件不存在则抛（计划已过期）。
+    /// 返回带 <see cref="BackupEntry.Sha256"/> 的新 entry：哈希只能在真正拷贝的这一刻记下，
+    /// 调用方必须把返回值（而不是传入的 entry）写进 manifest。
+    /// 拷贝前后各算一次哈希，不符即抛 <c>ChecksumMismatchException</c>——备份阶段就烂掉的
+    /// 备份件比没有备份更危险，因为它会让后续回滚看起来成功。
+    /// </summary>
+    BackupEntry Backup(BackupEntry entry);
 
     void WriteManifest(DeploymentManifest manifest);
 
@@ -4759,6 +4782,7 @@ using System.IO.Abstractions.TestingHelpers;
 using Deployer.Core.Deployment;
 using Deployer.Core.Domain;
 using Deployer.Core.Profiles;
+using Deployer.Core.Util;
 using Xunit;
 
 namespace Deployer.Core.Tests;
@@ -4833,19 +4857,55 @@ public class BackupStoreTests
     }
 
     [Fact]
+    public void Backup_records_the_source_hash_so_rollback_can_verify_it()
+    {
+        _fs.AddFile(@"C:\game\winmm.dll", new MockFileData("GAME OWN WINMM"));
+        var entry = Entry(Guid.NewGuid(), "winmm.dll");
+
+        var returned = Store().Backup(entry);
+
+        // 传进来的 entry 不变（planner 那份计划里 Sha256 仍是 null），返回值才带哈希。
+        // executor 必须接住返回值写进 manifest，否则回滚只能盲拷。
+        Assert.Null(entry.Sha256);
+        Assert.Equal(Hashing.Sha256OfFile(_fs, entry.OriginalPath), returned.Sha256);
+        Assert.Equal(entry.OriginalPath, returned.OriginalPath);
+        Assert.Equal(entry.BackupPath, returned.BackupPath);
+        Assert.Equal(entry.Reason, returned.Reason);
+    }
+
+    [Fact]
     public void ReadManifest_returns_null_for_missing_file()
     {
         Assert.Null(Store().ReadManifest($@"{Root}\nope\nope\manifest.json"));
     }
 
     [Fact]
-    public void ReadManifest_returns_null_for_corrupt_json()
+    public void ReadManifest_throws_with_the_real_cause_when_the_file_exists_but_is_unreadable()
     {
         var store = Store();
-        var planId = Guid.NewGuid();
-        _fs.AddFile(store.ManifestPathFor(Fingerprint, planId), new MockFileData("{ 不是 JSON"));
+        var path = store.ManifestPathFor(Fingerprint, Guid.NewGuid());
+        _fs.AddFile(path, new MockFileData("{ 不是 JSON"));
 
-        Assert.Null(store.ReadManifest(store.ManifestPathFor(Fingerprint, planId)));
+        // 「存在但读不出来」绝不能和「不存在」一样返回 null：那样 RollbackExecutor
+        // 只会说「备份清单损坏或被删除」，把真正的起因连同堆栈一起吞掉。
+        // 「无法回滚」是用户唯一拿不回游戏的那条路径，它必须带着现场信息响。
+        var ex = Assert.Throws<InvalidDataException>(() => store.ReadManifest(path));
+        Assert.Contains(path, ex.Message);
+        Assert.NotNull(ex.InnerException);
+    }
+
+    [Fact]
+    public void ListPlanIds_still_lists_a_plan_whose_manifest_is_corrupt()
+    {
+        var store = Store();
+        var good = Guid.Parse("11111111-1111-1111-1111-111111111111");
+        var bad = Guid.Parse("22222222-2222-2222-2222-222222222222");
+        store.WriteManifest(TestManifest(good, new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc)));
+        _fs.AddFile(store.ManifestPathFor(Fingerprint, bad), new MockFileData("{ 不是 JSON"));
+
+        // 这是 ReadJson 严格化之后**唯一**的容忍点：一份坏清单不该把整个列表挡死，
+        // 否则用户连还能用的备份都看不见。坏的那份排到最后，真去回滚它时才会响亮地失败。
+        Assert.Equal(new[] { good, bad }, store.ListPlanIds(Fingerprint));
     }
 
     [Fact]
@@ -4939,7 +4999,9 @@ public class BackupStoreTests
 ```csharp
 using System.IO.Abstractions;
 using Deployer.Core.Domain;
+using Deployer.Core.Errors;
 using Deployer.Core.Serialization;
+using Deployer.Core.Util;
 
 namespace Deployer.Core.Deployment;
 
@@ -4972,7 +5034,7 @@ public sealed class BackupStore : IBackupStore
     public string ProgressPathFor(string fingerprint, Guid planId) =>
         _fs.Path.Combine(DirectoryFor(fingerprint, planId), ProgressFileName);
 
-    public void Backup(BackupEntry entry)
+    public BackupEntry Backup(BackupEntry entry)
     {
         if (!_fs.File.Exists(entry.OriginalPath))
         {
@@ -4987,7 +5049,21 @@ public sealed class BackupStore : IBackupStore
             _fs.Directory.CreateDirectory(dir);
         }
 
+        // 拷贝**前**先算原件哈希：这是回滚时唯一的独立参照物，必须在原件还没被覆盖时拿到。
+        var source = Hashing.Sha256OfFile(_fs, entry.OriginalPath);
+
         _fs.File.Copy(entry.OriginalPath, entry.BackupPath, overwrite: true);
+
+        // 拷贝**后**再算备份件哈希。不符说明这次拷贝本身就没落地完整（磁盘满、杀软拦截、
+        // 云占位符未水合、路径被重定向）。此时必须抛而不是继续：一份坏备份会让后续回滚
+        // 「成功」地把坏文件装回游戏目录，比此刻失败难收拾得多。
+        var copied = Hashing.Sha256OfFile(_fs, entry.BackupPath);
+        if (!string.Equals(copied, source, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ChecksumMismatchException(entry.BackupPath, source, copied);
+        }
+
+        return entry.WithSha256(source);
     }
 
     public void WriteManifest(DeploymentManifest manifest) =>
@@ -5022,8 +5098,21 @@ public sealed class BackupStore : IBackupStore
                 continue;
             }
 
-            var manifest = ReadJson<DeploymentManifest>(_fs.Path.Combine(dir, ManifestFileName));
-            result.Add((planId, manifest?.CreatedUtc ?? DateTime.MinValue));
+            // 这里**故意**容忍坏 manifest，是本类唯一的容忍点：只列出 planId 不该被其中
+            // 一份坏清单挡死，否则用户连别的还能用的备份都看不见。坏的那份按
+            // DateTime.MinValue 排到最后；真去回滚它时 ReadManifest 会带着内层异常响亮地失败。
+            DateTime createdUtc;
+            try
+            {
+                createdUtc = ReadJson<DeploymentManifest>(_fs.Path.Combine(dir, ManifestFileName))?.CreatedUtc
+                             ?? DateTime.MinValue;
+            }
+            catch (Exception)
+            {
+                createdUtc = DateTime.MinValue;
+            }
+
+            result.Add((planId, createdUtc));
         }
 
         return result.OrderByDescending(x => x.Created).Select(x => x.Id).ToList();
@@ -5058,19 +5147,25 @@ public sealed class BackupStore : IBackupStore
 
     private T? ReadJson<T>(string path) where T : class
     {
+        if (!_fs.File.Exists(path))
+        {
+            // 文件不存在是**合法**状态：还没部署过，或已被 Prune 清掉。返回 null。
+            return null;
+        }
+
         try
         {
-            if (!_fs.File.Exists(path))
-            {
-                return null;
-            }
-
-            return DeployerJson.Deserialize<T>(_fs.File.ReadAllText(path));
+            return DeployerJson.Deserialize<T>(_fs.File.ReadAllText(path))
+                ?? throw new InvalidDataException("内容是 JSON null。");
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // 损坏的 manifest 不能让程序崩；调用方拿到 null 后会提示「无法自动回滚，需手工处理」
-            return null;
+            // 「存在但读不出来」与「不存在」是两件完全不同的事，绝不能都返回 null。
+            // 混为一谈的代价：RollbackExecutor 只会说「备份清单损坏或被删除，需手工处理」，
+            // 把真正的起因（JSON 半截写入、枚举名对不上、磁盘读失败）连同堆栈一起吞掉。
+            // 「无法回滚」是用户唯一拿不回游戏的那条路径，它必须带着现场信息响。
+            // 本方法**不**吞异常；唯一的容忍点在 ListPlanIds，且那里写了理由。
+            throw new InvalidDataException($"读不出来：{path}", ex);
         }
     }
 }
@@ -5125,6 +5220,7 @@ using System.IO.Abstractions;
 using System.IO.Abstractions.TestingHelpers;
 using Deployer.Core.Deployment;
 using Deployer.Core.Domain;
+using Deployer.Core.Util;
 using Xunit;
 
 namespace Deployer.Core.Tests;
@@ -5219,16 +5315,70 @@ public class RollbackExecutorTests
         _fs.AddFile(backupPath, new MockFileData("GAME OWN VERSION DLL v1.2.3"));
         _fs.AddFile(original, new MockFileData("OPTISCALER REPLACEMENT"));
 
+        // 主路径：BackupEntry 带着备份当时记下的哈希，还原后逐字比对。
+        Manifest(planId,
+            new[]
+            {
+                new BackupEntry(original, backupPath, BackupReason.OverwriteGameFile,
+                    Hashing.Sha256OfFile(_fs, backupPath)),
+            },
+            new[] { original }, Array.Empty<string>());
+
+        var result = _rollback.Rollback(_store.ManifestPathFor(Fingerprint, planId));
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Equal("GAME OWN VERSION DLL v1.2.3", _fs.File.ReadAllText(original));
+        Assert.Contains(original, result.RestoredPaths);
+        Assert.DoesNotContain(original, result.DeletedPaths);
+    }
+
+    [Fact]
+    public void Reports_failure_when_the_backup_was_corrupted_while_in_storage()
+    {
+        var original = $@"{DeployDir}\version.dll";
+        var planId = Guid.NewGuid();
+        var backupPath = BackupPath(planId, "version.dll");
+        _fs.AddFile(backupPath, new MockFileData("GAME OWN VERSION DLL v1.2.3"));
+        _fs.AddFile(original, new MockFileData("OPTISCALER REPLACEMENT"));
+
+        // 先记下正确哈希，再在**备份完成之后**改坏备份件——模拟磁盘错误、杀软、
+        // 云同步截断这类在存放期间发生的事。哈希与此刻的磁盘状态分属两个时间点，
+        // 所以这不是「校验它等于校验自己」。
+        var goodHash = Hashing.Sha256OfFile(_fs, backupPath);
+        Manifest(planId,
+            new[] { new BackupEntry(original, backupPath, BackupReason.OverwriteGameFile, goodHash) },
+            new[] { original }, Array.Empty<string>());
+        _fs.File.WriteAllText(backupPath, "TRUNCATED");
+
+        var result = _rollback.Rollback(_store.ManifestPathFor(Fingerprint, planId));
+
+        // 没有这条校验，上面那个坏文件会被装回游戏目录，而 result.Success 会是 true：
+        // 用户以为游戏复原了，实际上它已经坏了，而且再没有第二份副本。
+        // 注意此时确实没有更好的选择（副本已坏），如实验警是唯一正确的做法。
+        Assert.False(result.Success);
+        Assert.Contains(original, result.ErrorMessage!);
+    }
+
+    [Fact]
+    public void Still_rolls_back_a_manifest_written_before_the_hash_field_existed()
+    {
+        var original = $@"{DeployDir}\version.dll";
+        var planId = Guid.NewGuid();
+        var backupPath = BackupPath(planId, "version.dll");
+        _fs.AddFile(backupPath, new MockFileData("GAME OWN VERSION DLL v1.2.3"));
+        _fs.AddFile(original, new MockFileData("OPTISCALER REPLACEMENT"));
+
+        // Sha256 缺省为 null，这就是本字段引入之前写下的旧 manifest 的样子。
+        // 旧 manifest 必须仍然能回滚：「任何时候都能回滚」是核心承诺，不能因为
+        // 新增了一个校验字段就把老用户的备份变成废纸。代价是这一条路径上没有校验。
         Manifest(planId,
             new[] { new BackupEntry(original, backupPath, BackupReason.OverwriteGameFile) },
             new[] { original }, Array.Empty<string>());
 
         var result = _rollback.Rollback(_store.ManifestPathFor(Fingerprint, planId));
 
-        Assert.True(result.Success);
+        Assert.True(result.Success, result.ErrorMessage);
         Assert.Equal("GAME OWN VERSION DLL v1.2.3", _fs.File.ReadAllText(original));
-        Assert.Contains(original, result.RestoredPaths);
-        Assert.DoesNotContain(original, result.DeletedPaths);
     }
 
     [Fact]
@@ -5355,6 +5505,8 @@ Expected: 编译错误 `RollbackExecutor 不存在`
 ```csharp
 using System.IO.Abstractions;
 using Deployer.Core.Domain;
+using Deployer.Core.Errors;
+using Deployer.Core.Util;
 
 namespace Deployer.Core.Deployment;
 
@@ -5373,11 +5525,22 @@ public sealed class RollbackExecutor : IRollbackExecutor
 
     public RollbackResult Rollback(string manifestPath)
     {
-        var manifest = _backups.ReadManifest(manifestPath);
-        if (manifest is null)
+        DeploymentManifest manifest;
+        try
+        {
+            // ReadManifest 只在「文件不存在」时返回 null；「存在但读不出来」会抛，
+            // 并把真正的起因（JSON 语法错、枚举名对不上、磁盘读失败）放在 InnerException 里。
+            // 两条路径都在这里收口成一个带原因的 RollbackResult，因为接口契约规定
+            // 「回滚失败不抛异常」——它必须能把已完成的还原清单交代给用户。
+            manifest = _backups.ReadManifest(manifestPath)
+                ?? throw new FileNotFoundException($"找不到备份清单：{manifestPath}", manifestPath);
+        }
+        catch (Exception ex)
         {
             return new RollbackResult(false, Array.Empty<string>(), Array.Empty<string>(),
-                $"无法读取备份清单：{manifestPath}。可能是文件损坏或被删除，需手工处理。");
+                $"无法读取备份清单：{manifestPath}。需手工处理。"
+                + $"原因：{ex.Message}"
+                + (ex.InnerException is { } inner ? $"（{inner.Message}）" : null));
         }
 
         var restored = new List<string>();
@@ -5455,9 +5618,24 @@ public sealed class RollbackExecutor : IRollbackExecutor
             _fs.Directory.CreateDirectory(dir);
         }
 
-        // 直接覆写而不走 AtomicFileWriter：回滚的目标是把文件变回原样，
-        // 而备份件没有计划里的 SHA256 可供校验（校验它等于校验自己）。
+        // 直接覆写而不走 AtomicFileWriter：回滚的目标是把文件变回原样，中途失败留在
+        // 原地的半个文件比覆写失败更糟；tmp+bak 反而会在游戏目录里多留残留物。
         _fs.File.Copy(entry.BackupPath, entry.OriginalPath, overwrite: true);
+
+        // 还原后校验。entry.Sha256 是**备份当时**由 BackupStore 记下的，与此刻的磁盘
+        // 状态分属两个时间点、相互独立，所以这不是「校验它等于校验自己」。
+        // 备份件若在存放期间被磁盘错误或杀软改动过，这里会响；不校验就会把坏文件
+        // 装回游戏目录并宣称回滚成功。抛出去由 Rollback 的 catch 计入 errors，
+        // 最终 Success=false——没有更好的副本可用，如实验警是唯一正确的做法。
+        // Sha256 为 null 只可能是本字段引入之前写下的旧 manifest，此时跳过校验（前向兼容）。
+        if (entry.Sha256 is not null)
+        {
+            var actual = Hashing.Sha256OfFile(_fs, entry.OriginalPath);
+            if (!string.Equals(actual, entry.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ChecksumMismatchException(entry.OriginalPath, entry.Sha256, actual);
+            }
+        }
     }
 
     private void TryDeleteFile(string path, List<string> deleted, List<string> errors)
@@ -5830,7 +6008,7 @@ public class DeploymentExecutorTests
         public string DirectoryFor(string fingerprint, Guid planId) => _inner.DirectoryFor(fingerprint, planId);
         public string ManifestPathFor(string fingerprint, Guid planId) => _inner.ManifestPathFor(fingerprint, planId);
         public string ProgressPathFor(string fingerprint, Guid planId) => _inner.ProgressPathFor(fingerprint, planId);
-        public void Backup(BackupEntry entry) { _calls.Add("backup"); _inner.Backup(entry); }
+        public BackupEntry Backup(BackupEntry entry) { _calls.Add("backup"); return _inner.Backup(entry); }
         public void WriteManifest(DeploymentManifest m) { _calls.Add("manifest"); _inner.WriteManifest(m); }
         public DeploymentManifest? ReadManifest(string p) => _inner.ReadManifest(p);
         public void WriteProgress(DeploymentProgress p) { _calls.Add("progress"); _inner.WriteProgress(p); }
@@ -5888,18 +6066,31 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
         var createdDirectories = new List<string>();
         var completed = new List<string>();
 
-        // 1. manifest 先落盘（CreatedDirectories 此时还未知，第 5 步回填）。
+        // backups 起初就是 plan.Backups（Sha256 全为 null），第 2 步换成带哈希的版本。
+        // 之所以用一个单独的列表：BuildManifest 会在第 1/2b/4 步被调用三次，每次都应该
+        // 反映「当下已知的最完整真相」。
+        var backups = plan.Backups.ToList();
+
+        // 1. manifest 先落盘（CreatedDirectories 与 Sha256 此时还未知，后面回填）。
         //    这一步换来的是「此后任何时刻崩溃都能完整回滚」。
-        _backups.WriteManifest(BuildManifest(plan, createdDirectories));
+        _backups.WriteManifest(BuildManifest(plan, createdDirectories, backups));
 
         try
         {
-            // 2. 把所有要被覆盖的原件抢进影子目录——必须在任何写入之前全部完成
+            // 2. 把所有要被覆盖的原件抢进影子目录——必须在任何写入之前全部完成。
+            //    Backup 返回的是带 Sha256 的新 entry，必须接住返回值；丢掉它就等于
+            //    把回滚退化成盲拷（拷回去的是不是当初那份，无从知道）。
+            backups = new List<BackupEntry>();
             foreach (var entry in plan.Backups)
             {
                 ct.ThrowIfCancellationRequested();
-                _backups.Backup(entry);
+                backups.Add(_backups.Backup(entry));
             }
+
+            // 2b. 立即用带哈希的 backups 重写 manifest。等到第 4 步再写会留下一个窗口：
+            //     如果在写完文件之后、回填之前崩溃，磁盘上那份 manifest 的哈希全是 null，
+            //     回滚就只能盲拷。manifest 是小 JSON，多写一次换来窗口关闭，值得。
+            _backups.WriteManifest(BuildManifest(plan, createdDirectories, backups));
 
             _backups.WriteProgress(DeploymentProgress.Empty(plan.PlanId, manifestPath));
 
@@ -5917,8 +6108,8 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
                 });
             }
 
-            // 4. 回填真实的 CreatedDirectories
-            _backups.WriteManifest(BuildManifest(plan, createdDirectories));
+            // 4. 回填真实的 CreatedDirectories（backups 里的哈希已在 2b 落盘）
+            _backups.WriteManifest(BuildManifest(plan, createdDirectories, backups));
 
             _backups.Prune(fingerprint, KeepBackups);
             return new DeploymentResult(true, manifestPath, completed, errorMessage: null, rolledBack: false);
@@ -5931,12 +6122,13 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
         catch (Exception ex)
         {
             var rolledBack = TryRollback(manifestPath);
-            var message = ex is DeployerException de ? de.UserMessage : $"部署失败：{ex.Message}";
+            var message = ex is DeployerException ? ex.Message : $"部署失败：{ex.Message}";
             return new DeploymentResult(false, manifestPath, completed, message, rolledBack);
         }
     }
 
-    private DeploymentManifest BuildManifest(DeploymentPlan plan, IReadOnlyList<string> createdDirectories) => new()
+    private DeploymentManifest BuildManifest(DeploymentPlan plan, IReadOnlyList<string> createdDirectories,
+        IReadOnlyList<BackupEntry> backups) => new()
     {
         PlanId = plan.PlanId,
         CreatedUtc = DateTime.UtcNow,
@@ -5946,7 +6138,7 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
         Payload = plan.Payload,
         Identity = plan.Identity,
         Profile = plan.Profile,
-        Backups = plan.Backups,
+        Backups = backups,
         WrittenPaths = plan.Writes.Select(w => w.DestinationPath).ToList(),
         CreatedDirectories = createdDirectories.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
     };
@@ -6252,7 +6444,10 @@ public sealed class JsonInstallLedger : IInstallLedger
         catch (Exception)
         {
             // 台账损坏不能阻止启动；最坏情况是用户看不到已装列表，但 manifest 仍在磁盘上，
-            // CLI 的 rollback --manifest 依旧可用
+            // CLI 的 rollback --manifest 依旧可用。容忍的代价是下一次 Save 会覆写掉坏文件；
+            // 这是可接受的，因为台账只是**索引**而不是真相源——每个游戏的
+            // backups\<fingerprint>\<planId>\manifest.json 才是，ListPlanIds 能重新找到它们。
+            // 注意与 BackupStore.ReadJson 的区别：那边是「拿不回游戏」的路径，必须响。
             return new List<InstallRecord>();
         }
     }
@@ -6592,7 +6787,7 @@ public static class Program
         }
         catch (Exception ex)
         {
-            return Fail(ex.Message);
+            return Fail(ex.Message, ex);
         }
     }
 
@@ -6822,9 +7017,20 @@ public static class Program
             """);
     }
 
-    private static int Fail(string message)
+    private static int Fail(string message, Exception? ex = null)
     {
         Console.Error.WriteLine($"错误：{message}");
+
+        if (ex is not null)
+        {
+            // CLI 就是日志：技术细节没有别的落点，丢了就再没人能复现现场。
+            // 对自家异常而言 DeployerException.ToString() 已把 Diagnostic 追加在 Message 之后，
+            // 对外来异常而言会带堆栈——两种情形下打 ex.ToString() 一条就够。
+            // 空一行隔开，让用户话术不被技术输出淹掉。
+            Console.Error.WriteLine();
+            Console.Error.WriteLine(ex.ToString());
+        }
+
         return 1;
     }
 
@@ -7011,7 +7217,7 @@ public sealed record FileWrite(
 
 在 §5.5 「整计划」那段后面补一句：
 
-> `manifest.json` 在执行**开始前**就写盘（`CreatedDirectories` 先置空、完成后回填）。因此只要 manifest 存在，任何中途失败——包括进程被强杀——都能完整回滚。`progress.json` 不是回滚的必要输入，它只是诊断信息与 Plan D 中主进程接管崩溃 Worker 的提示。回滚建立在单一数据源上，比「两个文件必须互相一致」健壮得多。
+> `manifest.json` 在执行**开始前**就写盘（`CreatedDirectories` 与 `BackupEntry.Sha256` 先置空、完成后回填）。因此只要 manifest 存在，任何中途失败——包括进程被强杀——都能完整回滚。`progress.json` 不是回滚的必要输入，它只是诊断信息与 Plan D 中主进程接管崩溃 Worker 的提示。回滚建立在单一数据源上，比「两个文件必须互相一致」健壮得多。
 
 - [ ] **Step 5: 给 §5.5 补上 UTF-8 无 BOM 的要求**
 
@@ -7031,7 +7237,21 @@ public sealed record FileWrite(
 
 > `DeploymentManifest`（`manifest.json`）与 `InstallRecord`（`ledger.json`）是**跨版本长寿命持久化**类型：安装时写盘，可能数月后被更高版本的工具读回。`System.Text.Json` 在反序列化缺失 `required` 成员的 JSON 时会抛异常，因此 v1 发布之后，对这两个类型的任何新增字段**必须是可空类型或带默认值，禁止使用 `required`**——否则旧版本写下的 manifest/ledger 在新版工具下会读不回来，用户将无法回滚当初装过的游戏，而「任何时候都能回滚」正是本工具的核心承诺。若确需破坏性变更，先引入 `SchemaVersion` 并写兼容分支。（`DeploymentPlan` 只在同一二进制版本内跨进程传递，不受此约束。）
 
-- [ ] **Step 8: 全量验证**
+- [ ] **Step 8: 给 §5.6（影子备份）与 §11.1（回滚）补上哈希校验链**
+
+spec 初稿里回滚被描述成「把备份件拷回去」，没提校验。实现时发现这不够：备份件在存放期间可能被磁盘错误、杀软或云同步截断，盲拷回去会**把坏文件装进游戏目录并宣称回滚成功**，而且此时再没有第二份副本。在 §5.6 补：
+
+> 影子备份在拷贝时记下原件的 SHA256（`BackupEntry.Sha256`，写进 `manifest.json`）。拷贝前后各算一次，不符即抛——备份阶段就烂掉的备份件比没有备份更危险。哈希只能在真正拷贝的那一刻记下（planner 不哈希游戏自带文件，太慢也不是它的职责），所以 `Backup` 返回带哈希的新 entry，executor 必须接住返回值并在备份完成后**立即**重写 manifest；等到全部写完再回填会留下一个窗口，在那里崩溃就会让磁盘上的哈希全是 null。
+
+在 §11.1 补：
+
+> 回滚还原每个文件后重算哈希并与 `BackupEntry.Sha256` 比对。这**不是**「校验它等于校验自己」：哈希是备份当时记下的，与回滚那一刻的磁盘状态分属两个时间点，相互独立。不符则计入 `RollbackResult.Errors` 且 `Success=false`——此时确实没有更好的副本可用，如实验警是唯一正确的做法，静默宣称成功则是本工具承诺绝不发生的事。`Sha256` 为 `null` 只可能是该字段引入之前写下的旧 manifest，此时跳过校验：不能因为新增了一个校验字段就把老用户的备份变成废纸。
+
+同时在 §5.6 补一句关于 `manifest.json` 读失败的规定：
+
+> 「文件不存在」是合法状态（还没部署过、或已被 `Prune` 清掉），返回 null；「存在但读不出来」必须抛并带上内层异常。两者混为一谈的代价是：回滚失败时只会得到「清单损坏或被删除」，而真正的起因（JSON 半截写入、枚举名对不上、磁盘读失败）连同堆栈一起被吞掉。「无法回滚」是用户唯一拿不回游戏的那条路径，它必须带着现场信息响。唯一的容忍点是 `ListPlanIds`：一份坏清单不该把整个列表挡死，否则用户连还能用的备份都看不见。
+
+- [ ] **Step 9: 全量验证**
 
 Run:
 ```powershell
@@ -7041,7 +7261,7 @@ dotnet test OptiScalerDeployer.sln -c Release
 ```
 Expected: build `0 警告 0 错误`；test `失败: 0`
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add docs tools
@@ -7098,6 +7318,9 @@ git commit -m "docs(deployer): sync spec with Plan A type refinements"
 | CLI 里多一个 `ProfileStore` 包装类 | `JsonProfileStore` 已实现 `IProfileStore`，包装纯属噪音 | 已删，`Plan` 直接构造 `JsonProfileStore` |
 | `ChecksumMismatchException` / `HealthCheckFailedException` 把构造函数参数用在属性初始化器里 | 4 个 CS0103 硬编译错误，Task 3 直接建不起来 | 已改为构造函数体 / 表达式构造体（Task 3 Step 1） |
 | 5 处断言用 `Assert.Equal` 直接比含 `IReadOnlyList<T>` 成员的 record | record 对这类字段是**引用相等**（xUnit 又会优先走 `IEquatable<T>` 而绕开自己的集合比较），测试必然变红，且失败信息极具误导性 | 新增 `JsonAssert.Equivalent` 并改完 5 处（Task 3 Step 7、Task 9 两处、Task 10 两处） |
+| `BackupEntry` 不记哈希，`CopyBack` 的注释还把它说成「校验它等于校验自己」 | 影子备份若在存放期间被磁盘错误/杀软截断，回滚会**把坏文件装回游戏目录并报 `Success=true`**，而且此时再没有第二份副本。这个理由不成立：哈希可以在备份时记下，与回滚那一刻的磁盘状态分属两个时间点 | `BackupEntry` 加可空 `Sha256`；`Backup` 改为返回带哈希的 entry 且拷贝前后各算一次；executor 备份完立即重写 manifest；`CopyBack` 还原后校验，不符计入 errors（Task 2/10/11/12，Task 16 Step 8 回写 spec） |
+| `BackupStore.ReadJson` 把「存在但读不出来」吞成 null | 回滚失败时只能报「清单损坏或被删除」，真正的起因（JSON 半截写入、枚举名对不上、磁盘读失败）连同堆栈一起被吞——而这是用户唯一拿不回游戏的那条路径 | 改为抛 `InvalidDataException` 并包住内层异常；`RollbackExecutor` 把原因写进 `ErrorMessage`；`ListPlanIds` 作为**唯一**容忍点并写明理由（Task 10/11） |
+| CLI 的 `Fail(ex.Message)` 把 `Diagnostic` 整条丢掉 | `DeployerException.ToString()` 追加的诊断串在 CLI 路径上无人调用；现场信息没有别的落点，用户报 bug 时只能说「错误：找不到 OptiScaler 产物」 | `Fail` 加可选 `Exception?` 参数，额外打一行 `ex.ToString()`；顶层 catch 改成 `Fail(ex.Message, ex)`（Task 15） |
 
 执行过程中唯一需要临时调整的既知项：Task 12 Step 2 的 `Executor()` 辅助方法依赖 Task 11 的 `RollbackExecutor`。若你打乱任务顺序、先做 Task 12，那一个「失败中途回滚」的测试需临时 `Skip`；按 Task 编号顺序执行则无此问题。
 
