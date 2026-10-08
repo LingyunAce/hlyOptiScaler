@@ -718,7 +718,7 @@ git commit -m "feat(deployer): add core domain records and enums"
 - Test: `tests/Deployer.Core.Tests/JsonAssert.cs`（测试辅助，非测试）
 - Test: `tests/Deployer.Core.Tests/DeployerJsonTests.cs`
 
-- [ ] **Step 1: 写 `Errors/DeployerException.cs`**
+- [x] **Step 1: 写 `Errors/DeployerException.cs`**
 
 每个异常带 `UserMessage`（给用户看的中文短句）与 `Diagnostic`（给日志的技术细节）—— spec §10 要求 UI 能渲染「出了什么问题 / 建议怎么做 / 详细日志」三段式。
 
@@ -799,7 +799,7 @@ public sealed class HealthCheckFailedException : DeployerException
 
 构造函数参数**不能**用在属性初始化器里（`public string Path { get; } = path;` 会报 4 个 CS0103：参数在属性初始化器中不在作用域内）。要么用表达式构造体 `=> Path = path;`，要么用构造函数体 `{ Path = path; }`——上面两个类各用了一种，与同文件里 `GameNotWritableException` 的风格一致。
 
-- [ ] **Step 2: 写 `Serialization/DeployerJson.cs`**
+- [x] **Step 2: 写 `Serialization/DeployerJson.cs`**
 
 plan / manifest / progress / ledger 四种文件都要跨进程、跨会话读写，序列化选项必须只有一份。
 
@@ -829,7 +829,7 @@ public static class DeployerJson
 
 `JsonStringEnumConverter` 是必须的：plan 与 manifest 会被人打开来看，`"Chosen": 1` 毫无诊断价值，`"Chosen": "winmm"` 一眼就懂。
 
-- [ ] **Step 3: 写 `Util/Hashing.cs`**
+- [x] **Step 3: 写 `Util/Hashing.cs`**
 
 ```csharp
 using System.IO.Abstractions;
@@ -861,7 +861,7 @@ public static class Hashing
 
 `Sha256OfFile` 接 `IFileSystem` 而不是直接用 `System.IO.File`：否则在 `MockFileSystem` 上会去真磁盘找文件、直接抛 `FileNotFoundException`，所有依赖哈希的测试都跑不了。多传一个参数比注入 `Func<string, string>` 函数指针更好读，也不会遗漏。
 
-- [ ] **Step 4: 写 `Abstractions/IFileVersionReader.cs` 与 `WindowsFileVersionReader.cs`**
+- [x] **Step 4: 写 `Abstractions/IFileVersionReader.cs` 与 `WindowsFileVersionReader.cs`**
 
 `FileVersionInfo` 无法作用于 `MockFileSystem`，因此必须抽接口，测试注入假实现。
 
@@ -916,7 +916,7 @@ public sealed class WindowsFileVersionReader : IFileVersionReader
 
 `catch (Exception)` 在此处是有意的：这个方法的契约就是「读不出来返回 null」，调用方（身份选择器）会把 null 当作「这是游戏自带文件」处理，即走**保守路径**。吞异常在这里是安全的默认，不是偷懒。
 
-- [ ] **Step 5: 写 `HashingTests.cs`**
+- [x] **Step 5: 写 `HashingTests.cs`**
 
 ```csharp
 using System.IO.Abstractions.TestingHelpers;
@@ -964,12 +964,12 @@ public class HashingTests
 }
 ```
 
-- [ ] **Step 6: 跑测试，确认失败**
+- [x] **Step 6: 跑测试，确认失败**
 
 Run: `dotnet test OptiScalerDeployer.sln`
 Expected: **FAIL** —— `HashingTests` 编译不过（`Hashing` 尚未存在）。若 Step 3 已写完则会直接通过；此时改为确认 `通过: 13`。
 
-- [ ] **Step 7: 写 `JsonAssert.cs` 与 `DeployerJsonTests.cs`**
+- [x] **Step 7: 写 `JsonAssert.cs` 与 `DeployerJsonTests.cs`**
 
 先写辅助类。它解决一个会反复出现的坑：**含 `IReadOnlyList<T>` 成员的 record 不能用 `Assert.Equal` 直接比。**
 
@@ -1076,14 +1076,14 @@ public class DeployerJsonTests
 
 注意这里用的是 `JsonAssert.Equivalent` 而不是 `Assert.Equal`：`DeploymentManifest` 含四个集合成员（`Identity.SkippedDueToConflict`、`Profile.Edits`、`Backups`、`WrittenPaths`），直接用 `Assert.Equal` 会因引用相等而失败。上一项 `GameTarget_roundtrips` 用 `Assert.Equal` 是对的，因为 `GameTarget` 全是 string 与 enum，没有集合成员。
 
-- [ ] **Step 8: 跑测试**
+- [x] **Step 8: 跑测试**
 
 Run: `dotnet test OptiScalerDeployer.sln`
 Expected: `失败: 0，通过: 16`
 
 若 `Manifest_roundtrips` 失败，先看 xUnit 的差异输出：如果所有标量字段都相等、只有集合的**运行时类型**不同（`T[]` vs `List<T>`），那不是元素不等，而是你把它写成了 `Assert.Equal`——record 对 `IReadOnlyList<T>` 字段是引用相等（详见 Step 7 的 `JsonAssert` 注释），改用 `JsonAssert.Equivalent` 即可。只有在元素**值**真的不同时，才去查 `IniEdit` / `BackupEntry` 是不是漏了 `record` 关键字（被写成了 `class`）。
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add tools/OptiScalerDeployer
