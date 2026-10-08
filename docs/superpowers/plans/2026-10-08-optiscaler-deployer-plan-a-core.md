@@ -1355,11 +1355,13 @@ git commit -m "feat(deployer): add exceptions, json options, hashing and version
 
 Spec §8.2 的核心约束：**不重新序列化**。`OptiScaler.ini` 1571 行，一半价值在注释里；用 SimpleIni / IniParser 会把注释全丢，后续排查极痛苦。
 
-已核实的文件事实（决定实现细节）：
-- 行尾是 **CRLF**
+已核实的文件事实（决定实现细节；下面每个数字都用脚本对真文件实测过）：
+- 行尾是 **CRLF**（`crlf=1571 bareLf=0`，零混合行尾）、UTF-8 **无 BOM**
+- **864 / 1571 = 55% 是注释行**。这就是「不重新序列化」从「比较好」变成「硬约束」的原因
 - **零行内注释**：所有 `;` 注释都独占一行。因此「替换 `=` 右侧」不会误删注释
 - 键的写法是 `Key=value`（等号两侧无空格）
-- `Enabled=auto` 这类键名在多个 section 重复出现（`[FrameGen]` L25、L1154、L1172、L1234）—— **section 作用域匹配是硬性要求，不是优化**
+- **同一 section 内零重复键**（实测）。所以「命中即 `pending.Remove`」不会漏改；若将来 OptiScaler 上游引入了重复键，本实现只改**第一次出现**的那个，而 OptiScaler 自己的 SimpleIni 可能读到最后一个——那种不一致会表现为「改了但没生效」，需重新评估
+- `Enabled=auto` 这个键名在 **4 个不同的 section** 里各出现一次：`[FrameGen]` L25、`[OutputScaling]` L1154、`[CAS]` L1172、`[Magnifier]` L1234（全文 37 个 section，section 名零重复）—— **section 作用域匹配是硬性要求，不是优化**：不分作用域就会一次改掉四个不相干的功能开关
 
 **Files:**
 - Create: `src/Deployer.Core/Ini/IIniPatcher.cs`
@@ -1603,6 +1605,47 @@ public class IniPatcherTests
         Assert.Contains("Dx12Upscaler=dlss", result.Content);
         Assert.Single(result.AppliedEdits);
     }
+
+    [Fact]
+    public void Blank_section_is_rejected_instead_of_appending_an_empty_section_header()
+    {
+        var patcher = new IniPatcher();
+
+        // 不拦的话，Section 为空的 edit 会命中前言区或走进「新建 section」分支，
+        // 往用户的 OptiScaler.ini 末尾追加一个 [] 段——那是往游戏文件里写垃圾。
+        var ex = Assert.Throws<ArgumentException>(() => patcher.Patch(Sample, new[] { Edit("", "Foo", "1") }));
+
+        // 钉住消息里含 Section，这样消息退化成裸堆栈时会红
+        Assert.Contains("Section", ex.Message);
+    }
+
+    [Fact]
+    public void Blank_key_is_rejected()
+    {
+        var patcher = new IniPatcher();
+
+        // 用空白而非空串，确保守卫用的是 IsNullOrWhiteSpace 而不是 IsNullOrEmpty；
+        // Key 为空会命中任何以 = 开头的畸形行。
+        var ex = Assert.Throws<ArgumentException>(() => patcher.Patch(Sample, new[] { Edit("Upscalers", "   ", "1") }));
+
+        Assert.Contains("Key", ex.Message);
+    }
+
+    [Fact]
+    public void Mixed_line_endings_still_get_patched_instead_of_silently_skipping()
+    {
+        // 第 2 行以 bare LF 结尾。改之前这条 edit 会静默不生效：
+        // Foo=1\nDx12Upscaler=auto 被当成一行，匹配到的是 Foo。输出把那个 bare LF
+        // 归一化成 CRLF 是有意的（对「最小干预」的有意识让步，换取「不会静默漏改」）。
+        const string ini = "[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("Upscalers", "Dx12Upscaler", "ffx") });
+
+        Assert.Single(result.AppliedEdits);
+        Assert.Equal("auto", result.AppliedEdits[0].OldValue);
+        Assert.Equal("[Upscalers]\r\nFoo=1\r\nDx12Upscaler=ffx\r\n", result.Content);
+    }
 }
 ```
 
@@ -1621,14 +1664,39 @@ using Deployer.Core.Domain;
 
 namespace Deployer.Core.Ini;
 
+/// <remarks>
+/// 后来者最容易搞错的三件事，都写在实现之前：
+/// 1. **不重新序列化**是设计文档 §8.2 的硬约束，不是风格偏好。真 OptiScaler.ini
+///    共 1571 行，其中 864 行（55%）是注释；任何现成 INI 库（SimpleIni / IniParser）
+///    在解析-回写时都会把注释整片丢掉。所以这里坚持逐行文本改写，绝不 round-trip。
+/// 2. **section 作用域匹配是硬性要求**。同一个键名 Enabled=auto 在真文件里分属 4 个
+///    不同 section（[FrameGen] L25、[OutputScaling] L1154、[CAS] L1172、[Magnifier] L1234）。
+///    不按 section 限定，一条 edit 就会一次改掉四个毫不相干的功能开关。
+/// 3. **只替换 = 右侧**：左半部分（键名连同用户原有的空格）原样保留，这是最小干预的直接体现。
+/// </remarks>
 public sealed class IniPatcher : IIniPatcher
 {
     private const string AddedByDeployer = "; added by OptiScaler Deployer";
 
     public IniPatchResult Patch(string originalContent, IReadOnlyList<IniEdit> edits)
     {
+        // 空 Section / 空 Key 是**硬错误**，不是「匹配不上就算了」：Section 为空会命中
+        // 第一个 section 头之前的前言区，Key 为空会命中任何以 = 开头的畸形行；两者都
+        // 会让「新建 section」分支往用户的 OptiScaler.ini 末尾追加一个 [] 段——那是往
+        // 游戏文件里写垃圾。守卫放在这一层而不是调用方：IniPatcher 是真正落笔的地方，
+        // 而 edits 可能来自用户自己写的 profile JSON。
+        foreach (var edit in edits)
+        {
+            if (string.IsNullOrWhiteSpace(edit.Section) || string.IsNullOrWhiteSpace(edit.Key))
+            {
+                throw new ArgumentException(
+                    $"IniEdit 的 Section 与 Key 都不能为空白（实际：Section=\"{edit.Section}\"，Key=\"{edit.Key}\"）。",
+                    nameof(edits));
+            }
+        }
+
         var newLine = DetectNewLine(originalContent);
-        var lines = SplitLines(originalContent, newLine);
+        var lines = SplitLines(originalContent);
 
         if (edits.Count == 0)
         {
@@ -1750,9 +1818,21 @@ public sealed class IniPatcher : IIniPatcher
     private static string DetectNewLine(string content) =>
         content.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
 
-    private static List<string> SplitLines(string content, string newLine)
+    /// <summary>
+    /// 按 \n 切，再去掉每行末尾的 \r。这样混合行尾的文件也能被正确逐行解析。
+    /// </summary>
+    /// <remarks>
+    /// 若按检测到的 newLine 切，夹在 CRLF 文件里的 bare LF 会把相邻两行并成一行，
+    /// 那一行里的键会**静默**匹配不上——Join 能原样还原所以文件不会被写坏，
+    /// 但配置没生效，这是最难排查的一类失败。
+    /// 代价是输出会把零星 bare LF 归一化成主导行尾，这算是对「最小干预」的一次
+    /// 有意识让步：换取的是「不会静默漏改」。
+    /// 另一个已知的既有行为：输入不以换行结尾时，输出会补一个换行。真 OptiScaler.ini
+    /// 以换行结尾，且 edits 为空时 Patch 直接原样返回，所以实际碰不到。
+    /// </remarks>
+    private static List<string> SplitLines(string content)
     {
-        var parts = content.Split(new[] { newLine }, StringSplitOptions.None).ToList();
+        var parts = content.Split('\n').Select(l => l.EndsWith('\r') ? l[..^1] : l).ToList();
         // 文件以换行结尾时 Split 会多出一个空尾项；去掉它，Join 时统一补回
         if (parts.Count > 0 && parts[^1].Length == 0)
         {
@@ -1795,10 +1875,14 @@ public sealed class IniPatcher : IIniPatcher
 
 **`LastContentLineIndex` 存在的理由**：若直接用「下一个 section 头的前一行」作为插入点，而那一行是分隔用的空行，新键就会落在空行之后、与 section 本体隔开。功能上仍正确（还在同一个 section 里），但人读起来像是另一个区块。
 
+**为什么空 Section / 空 Key 是硬错误而不是「匹配不上就跳过」**：`currentSection` 初值是 `string.Empty`，一条 Section 为空白的 edit 会静默命中第一个 section 头之前的前言区；若没命中，就落进「新建 section」分支，往用户的 `OptiScaler.ini` 末尾追加一个 `[]` 段——那是往游戏文件里写垃圾，直接违背「绝不损坏游戏文件」这条第一承诺。Key 为空白同理，会命中任何以 `=` 开头的畸形行。失效方向是**静默写入垃圾**，所以必须抛 `ArgumentException` 而不是当作未命中。守卫放在 `IniPatcher` 而非调用方：它是真正落笔改游戏文件的那一层，而 edits 可能来自用户自己写的 profile JSON（Task 5 的 `JsonProfileStore` 从磁盘读），放在这最后一道关口才能同时覆盖 builtins、用户 JSON 与任何未来的调用方；Task 9 的 `BuildIniEdits` 因此不再重复校验。
+
+**为什么 `SplitLines` 改成按 `\n` 切再剥掉行尾 `\r`**：若按检测到的主导 `newLine` 切，一个以 CRLF 为主、却夹了几行 bare LF 的文件（用户拿 Unix 编辑器手改过就会这样），那几行会被并进相邻的同一个「行」字符串里。例如 `[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n` 会被切成 `["[Upscalers]", "Foo=1\nDx12Upscaler=auto"]`，于是针对 `Dx12Upscaler` 的 edit 实际匹配到的是 `Foo`。失效方向是**静默漏改**：`Join` 能原样还原所以文件不会被写坏，但「配置改了却没生效」是最难排查的一类失败。代价是输出会把零星 bare LF 归一化成主导行尾——这是对「最小干预」的一次有意识让步，换取的是「不会静默漏改」。仓库根目录的真 `OptiScaler.ini` 实测 `crlf=1571 bareLf=0`，当前无此风险，但用户手改过的 INI 不保证；纯 CRLF 与纯 LF 两种文件在改动前后行为完全一致（既有 13 个测试一个都没变红）。
+
 - [x] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter IniPatcherTests`
-Expected: `失败: 0，通过: 13`
+Expected: `失败: 0，通过: 16`
 
 - [x] **Step 6: 用真 INI 做一次人工核对**
 
@@ -1813,7 +1897,7 @@ $origComments = $orig | Where-Object { $_.TrimStart().StartsWith(';') -or $_.Tri
 "原文件注释行数: $($origComments.Count)"
 "原文件 section 数: $(($orig | Where-Object { $_ -match '^\s*\[' }).Count)"
 ```
-Expected: 记下三个数字（`1571` / 注释行数 / `36`）。计划 B 之后会有针对真 INI 的回归测试；此处仅建立基线。
+Expected: 记下三个数字（`1571` / `864` / `37`）。计划 B 之后会有针对真 INI 的回归测试；此处仅建立基线。三个数字已由控制器独立实测确认。
 
 - [x] **Step 7: Commit**
 
@@ -4288,6 +4372,9 @@ public sealed class DeploymentPlanner : IDeploymentPlanner
 
     private IReadOnlyList<IniEdit> BuildIniEdits(PlanRequest request)
     {
+        // 不需要在这里校验 Section/Key 非空：IniPatcher.Patch 已经把它们当成硬错误抛。
+        // 这一层再校一次只是重复；而且放那里才对：IniPatcher 是真正会把 `[]`
+        // 写进游戏文件的那一层，而 request.Profile.Edits 可能来自用户自己写的 JSON。
         var edits = new List<IniEdit>(request.Profile.Edits);
 
         if (request.EnableFrameGen)

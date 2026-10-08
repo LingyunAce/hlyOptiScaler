@@ -206,4 +206,45 @@ public class IniPatcherTests
         Assert.Contains("Dx12Upscaler=dlss", result.Content);
         Assert.Single(result.AppliedEdits);
     }
+
+    [Fact]
+    public void Blank_section_is_rejected_instead_of_appending_an_empty_section_header()
+    {
+        var patcher = new IniPatcher();
+
+        // 不拦的话，Section 为空的 edit 会命中前言区或走进「新建 section」分支，
+        // 往用户的 OptiScaler.ini 末尾追加一个 [] 段——那是往游戏文件里写垃圾。
+        var ex = Assert.Throws<ArgumentException>(() => patcher.Patch(Sample, new[] { Edit("", "Foo", "1") }));
+
+        // 钉住消息里含 Section，这样消息退化成裸堆栈时会红
+        Assert.Contains("Section", ex.Message);
+    }
+
+    [Fact]
+    public void Blank_key_is_rejected()
+    {
+        var patcher = new IniPatcher();
+
+        // 用空白而非空串，确保守卫用的是 IsNullOrWhiteSpace 而不是 IsNullOrEmpty；
+        // Key 为空会命中任何以 = 开头的畸形行。
+        var ex = Assert.Throws<ArgumentException>(() => patcher.Patch(Sample, new[] { Edit("Upscalers", "   ", "1") }));
+
+        Assert.Contains("Key", ex.Message);
+    }
+
+    [Fact]
+    public void Mixed_line_endings_still_get_patched_instead_of_silently_skipping()
+    {
+        // 第 2 行以 bare LF 结尾。改之前这条 edit 会静默不生效：
+        // Foo=1\nDx12Upscaler=auto 被当成一行，匹配到的是 Foo。输出把那个 bare LF
+        // 归一化成 CRLF 是有意的（对「最小干预」的有意识让步，换取「不会静默漏改」）。
+        const string ini = "[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("Upscalers", "Dx12Upscaler", "ffx") });
+
+        Assert.Single(result.AppliedEdits);
+        Assert.Equal("auto", result.AppliedEdits[0].OldValue);
+        Assert.Equal("[Upscalers]\r\nFoo=1\r\nDx12Upscaler=ffx\r\n", result.Content);
+    }
 }

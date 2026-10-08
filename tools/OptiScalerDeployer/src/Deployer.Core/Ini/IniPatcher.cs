@@ -3,14 +3,39 @@ using Deployer.Core.Domain;
 
 namespace Deployer.Core.Ini;
 
+/// <remarks>
+/// 后来者最容易搞错的三件事，都写在实现之前：
+/// 1. **不重新序列化**是设计文档 §8.2 的硬约束，不是风格偏好。真 OptiScaler.ini
+///    共 1571 行，其中 864 行（55%）是注释；任何现成 INI 库（SimpleIni / IniParser）
+///    在解析-回写时都会把注释整片丢掉。所以这里坚持逐行文本改写，绝不 round-trip。
+/// 2. **section 作用域匹配是硬性要求**。同一个键名 Enabled=auto 在真文件里分属 4 个
+///    不同 section（[FrameGen] L25、[OutputScaling] L1154、[CAS] L1172、[Magnifier] L1234）。
+///    不按 section 限定，一条 edit 就会一次改掉四个毫不相干的功能开关。
+/// 3. **只替换 = 右侧**：左半部分（键名连同用户原有的空格）原样保留，这是最小干预的直接体现。
+/// </remarks>
 public sealed class IniPatcher : IIniPatcher
 {
     private const string AddedByDeployer = "; added by OptiScaler Deployer";
 
     public IniPatchResult Patch(string originalContent, IReadOnlyList<IniEdit> edits)
     {
+        // 空 Section / 空 Key 是**硬错误**，不是「匹配不上就算了」：Section 为空会命中
+        // 第一个 section 头之前的前言区，Key 为空会命中任何以 = 开头的畸形行；两者都
+        // 会让「新建 section」分支往用户的 OptiScaler.ini 末尾追加一个 [] 段——那是往
+        // 游戏文件里写垃圾。守卫放在这一层而不是调用方：IniPatcher 是真正落笔的地方，
+        // 而 edits 可能来自用户自己写的 profile JSON。
+        foreach (var edit in edits)
+        {
+            if (string.IsNullOrWhiteSpace(edit.Section) || string.IsNullOrWhiteSpace(edit.Key))
+            {
+                throw new ArgumentException(
+                    $"IniEdit 的 Section 与 Key 都不能为空白（实际：Section=\"{edit.Section}\"，Key=\"{edit.Key}\"）。",
+                    nameof(edits));
+            }
+        }
+
         var newLine = DetectNewLine(originalContent);
-        var lines = SplitLines(originalContent, newLine);
+        var lines = SplitLines(originalContent);
 
         if (edits.Count == 0)
         {
@@ -132,9 +157,21 @@ public sealed class IniPatcher : IIniPatcher
     private static string DetectNewLine(string content) =>
         content.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
 
-    private static List<string> SplitLines(string content, string newLine)
+    /// <summary>
+    /// 按 \n 切，再去掉每行末尾的 \r。这样混合行尾的文件也能被正确逐行解析。
+    /// </summary>
+    /// <remarks>
+    /// 若按检测到的 newLine 切，夹在 CRLF 文件里的 bare LF 会把相邻两行并成一行，
+    /// 那一行里的键会**静默**匹配不上——Join 能原样还原所以文件不会被写坏，
+    /// 但配置没生效，这是最难排查的一类失败。
+    /// 代价是输出会把零星 bare LF 归一化成主导行尾，这算是对「最小干预」的一次
+    /// 有意识让步：换取的是「不会静默漏改」。
+    /// 另一个已知的既有行为：输入不以换行结尾时，输出会补一个换行。真 OptiScaler.ini
+    /// 以换行结尾，且 edits 为空时 Patch 直接原样返回，所以实际碰不到。
+    /// </remarks>
+    private static List<string> SplitLines(string content)
     {
-        var parts = content.Split(new[] { newLine }, StringSplitOptions.None).ToList();
+        var parts = content.Split('\n').Select(l => l.EndsWith('\r') ? l[..^1] : l).ToList();
         // 文件以换行结尾时 Split 会多出一个空尾项；去掉它，Join 时统一补回
         if (parts.Count > 0 && parts[^1].Length == 0)
         {
