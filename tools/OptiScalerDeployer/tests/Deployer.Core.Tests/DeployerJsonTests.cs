@@ -55,4 +55,34 @@ public class DeployerJsonTests
 
         JsonAssert.Equivalent(manifest, restored);
     }
+
+    [Fact]
+    public void Chinese_text_is_written_readable_not_escaped()
+    {
+        var json = DeployerJson.Serialize(new PlanWarning(WarningSeverity.Caution, "身份 DLL 全部冲突"));
+
+        Assert.Contains("身份 DLL 全部冲突", json);
+        Assert.DoesNotContain("\\u", json);
+    }
+
+    // 这些名字是 manifest.json 与 ledger.json 的**落盘契约**：改个成员名或改拼写，
+    // 旧 manifest 就反序列化不出来；BackupStore.ReadJson 会把它吞成 null；RollbackExecutor
+    // 接着报「读不到备份 manifest，可能已损坏或被删」—— 一次纯重构就这样静默且永久地
+    // 毁掉用户的回滚能力，而报错信息还指错了方向。
+    // 真要改，必须同时给 SchemaVersion 加兼容分支，并有意识地更新本测试。
+    [Theory]
+    [InlineData(typeof(PayloadOrigin), "localBuild", "gitHubRelease", "manualDirectory")]
+    [InlineData(typeof(DllIdentity), "dxgi", "winmm", "version", "dbghelp", "d3d12", "wininet", "winhttp", "asi")]
+    [InlineData(typeof(IdentityStatus), "resolved", "requiresUserDecision", "noCandidateAvailable")]
+    [InlineData(typeof(BackupReason), "overwriteGameFile", "overwritePreviousOpti", "iniModified")]
+    [InlineData(typeof(InstallState), "installed", "healthy", "rolledBack", "needsReinstall", "failed")]
+    public void Persisted_enum_wire_names_are_pinned(Type enumType, params string[] expectedWireNames)
+    {
+        var actualWireNames = Enum.GetValues(enumType)
+            .Cast<object>()
+            .Select(value => DeployerJson.Serialize(value).Trim('"'))
+            .ToArray();
+
+        Assert.Equal(expectedWireNames, actualWireNames);
+    }
 }

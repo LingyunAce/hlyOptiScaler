@@ -100,6 +100,7 @@ tools/OptiScalerDeployer/
     └── Deployer.Core.Tests/
         ├── Deployer.Core.Tests.csproj
         ├── JsonAssert.cs                 含集合的 record 用序列化比相等（见 Task 3 Step 7）
+        ├── WindowsFileVersionReaderTests.cs  全套里唯一碰真文件系统的测试（FileVersionInfo 用不了 MockFileSystem）
         ├── IniPatcherTests.cs
         ├── BuiltinProfilesTests.cs
         ├── LocalBuildPayloadSourceTests.cs
@@ -717,6 +718,7 @@ git commit -m "feat(deployer): add core domain records and enums"
 - Test: `tests/Deployer.Core.Tests/HashingTests.cs`
 - Test: `tests/Deployer.Core.Tests/JsonAssert.cs`（测试辅助，非测试）
 - Test: `tests/Deployer.Core.Tests/DeployerJsonTests.cs`
+- Test: `tests/Deployer.Core.Tests/WindowsFileVersionReaderTests.cs`
 
 - [x] **Step 1: 写 `Errors/DeployerException.cs`**
 
@@ -729,7 +731,7 @@ namespace Deployer.Core.Errors;
 public abstract class DeployerException : Exception
 {
     protected DeployerException(string userMessage, string diagnostic, Exception? inner = null)
-        : base(diagnostic, inner)
+        : base(userMessage, inner)
     {
         UserMessage = userMessage;
         Diagnostic = diagnostic;
@@ -740,6 +742,13 @@ public abstract class DeployerException : Exception
 
     /// <summary>给日志看的技术细节。</summary>
     public string Diagnostic { get; }
+
+    /// <summary>
+    /// <see cref="Exception.Message"/> 只带用户话术，所以这里把 <see cref="Diagnostic"/>
+    /// 追加回来，保证日志与崩溃转储里技术细节不丢。
+    /// </summary>
+    public override string ToString() =>
+        $"{base.ToString()}{Environment.NewLine}诊断：{Diagnostic}";
 }
 
 public sealed class PayloadNotFoundException : DeployerException
@@ -749,14 +758,25 @@ public sealed class PayloadNotFoundException : DeployerException
                diagnostic) { }
 }
 
+/// <remarks>
+/// 可写性在计划 A 里是**值**不是异常：<c>DirectoryWritability</c> 枚举 → <c>ElevationRequirement</c>
+/// → <c>PlanWarning</c>，探测结果一路带到 UI。本类型只保留给执行阶段**真的**写失败
+/// （已提权仍被拒、目录被独占等）。
+/// </remarks>
 public sealed class GameNotWritableException : DeployerException
 {
     public GameNotWritableException(string path, string diagnostic)
-        : base($"游戏目录不可写：{path}", diagnostic) => Path = path;
+        : base($"游戏目录不可写：{path}", diagnostic) => FilePath = path;
 
-    public string Path { get; }
+    public string FilePath { get; }
 }
 
+/// <remarks>
+/// 计划 A/B **不会**抛本异常。「全部候选身份都冲突」是以值的形式流转的：
+/// <c>DllIdentitySelector.Select</c> 返回 <c>IdentityStatus.RequiresUserDecision</c> 加一段
+/// <c>UserPromptMessage</c>，planner 把它转成 Caution 级 <c>PlanWarning</c>，UI 再给用户三个选项。
+/// 只有计划 C 需要表达「三个选项用户全拒了」时才考虑本类型，且要先确认不与上述值路径重复。
+/// </remarks>
 public sealed class IdentityConflictException : DeployerException
 {
     public IdentityConflictException(string deployDirectory, string diagnostic)
@@ -770,16 +790,22 @@ public sealed class ChecksumMismatchException : DeployerException
         : base($"文件校验失败：{path}。可能是磁盘空间不足或杀毒软件拦截。",
                $"expected SHA256 {expected}, actual {actual}, path {path}")
     {
-        Path = path;
+        FilePath = path;
         Expected = expected;
         Actual = actual;
     }
 
-    public string Path { get; }
+    public string FilePath { get; }
     public string Expected { get; }
     public string Actual { get; }
 }
 
+/// <remarks>
+/// 计划 D 专用。**用户取消 UAC 时绝不能抛本异常** —— spec §10 的失败点表明写「UAC 被拒
+/// **不算错误**」，那条路径要把结果记成 <c>ElevationRequirement.Declined</c>，并说明
+/// 「该游戏在受保护的 WindowsApps 里」；抛异常会让 executor 报 <c>Success=false</c>，正是 spec 禁止的。
+/// 本类型只留给提权**通道本身**失败的情形：runas 起不来、Worker 崩溃等。
+/// </remarks>
 public sealed class ElevationDeclinedException : DeployerException
 {
     public ElevationDeclinedException(string diagnostic)
@@ -787,6 +813,10 @@ public sealed class ElevationDeclinedException : DeployerException
                diagnostic) { }
 }
 
+/// <remarks>
+/// 计划 D 专用，由 <c>IHealthCheckRunner</c> 抛出。<see cref="LogExcerpt"/> 带着
+/// <c>OptiScaler.log</c> 的摘要，UI 把它显示在「一键回滚」按钮旁边（spec §10）。
+/// </remarks>
 public sealed class HealthCheckFailedException : DeployerException
 {
     public HealthCheckFailedException(string logExcerpt)
@@ -797,13 +827,18 @@ public sealed class HealthCheckFailedException : DeployerException
 }
 ```
 
-构造函数参数**不能**用在属性初始化器里（`public string Path { get; } = path;` 会报 4 个 CS0103：参数在属性初始化器中不在作用域内）。要么用表达式构造体 `=> Path = path;`，要么用构造函数体 `{ Path = path; }`——上面两个类各用了一种，与同文件里 `GameNotWritableException` 的风格一致。
+构造函数参数**不能**用在属性初始化器里（`public string FilePath { get; } = path;` 会报 4 个 CS0103：参数在属性初始化器中不在作用域内）。要么用表达式构造体 `=> FilePath = path;`，要么用构造函数体 `{ FilePath = path; }`——上面两个类各用了一种，与同文件里 `GameNotWritableException` 的风格一致。
+
+属性叫 `FilePath` 而不是 `Path`：`ImplicitUsings=enable` 把 `System.IO` 拉了进来，类内裸写 `Path` 会先绑定到**属性**，方法体里的 `Path.Combine(...)` 就编译不过了（Task 13 的 `DefaultPath` 也是为此才显式写 `System.IO.Path.Combine`）。这两个属性目前零消费者，是能免费改名的唯一窗口。
+
+基类把 `userMessage` 交给 `base(...)`，于是 `Exception.Message` 带的是**人话**，泛型错误处理（`catch (Exception ex) => ... ex.Message`）默认就是对的：Task 15 的 CLI 顶层那句 `return Fail(ex.Message)` 因此会把 spec §10 要求的两条出路（「用 VS2022 构建一次 OptiScaler.sln」/「手动指定产物目录」）摆到用户面前，而不是甩一串裸诊断。`Diagnostic` 仍然给日志用，并由 `ToString()` 追加回去，崩溃转储里技术细节不丢。Task 12 executor 里现有的 `ex is DeployerException de ? de.UserMessage : ...` 三元式依然正确，只是从此变成冗余。
 
 - [x] **Step 2: 写 `Serialization/DeployerJson.cs`**
 
 plan / manifest / progress / ledger 四种文件都要跨进程、跨会话读写，序列化选项必须只有一份。
 
 ```csharp
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -811,13 +846,23 @@ namespace Deployer.Core.Serialization;
 
 public static class DeployerJson
 {
-    public static JsonSerializerOptions Options { get; } = new()
+    public static JsonSerializerOptions Options { get; } = new JsonSerializerOptions
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
+        // 这些文件就是要给人打开来读的，默认 encoder 会把所有中文转成 \uXXXX；
+        // 输出只落 .json 文件、从不内联进 HTML，所以放宽转义不带来安全损失。
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
+
+    // 冻结成只读：Options 是五种落盘文件共用的单例，{ get; } 只防重新赋值，对象本身仍可改，
+    // 一句杂散的 WriteIndented = false 就会静默重排所有文件（而且 JsonAssert 两边一起变，测试照样绿）。
+    // MakeReadOnly() 返回 void，串不进初始化表达式，只能放在静态构造里；必须传
+    // populateMissingResolver: true，否则无参重载会因未指定 TypeInfoResolver 而抛异常。
+    // 附带好处：只读 Options 能走 JsonSerializer 的缓存快路径。
+    static DeployerJson() => Options.MakeReadOnly(populateMissingResolver: true);
 
     public static string Serialize<T>(T value) => JsonSerializer.Serialize(value, Options);
 
@@ -828,6 +873,10 @@ public static class DeployerJson
 ```
 
 `JsonStringEnumConverter` 是必须的：plan 与 manifest 会被人打开来看，`"Chosen": 1` 毫无诊断价值，`"Chosen": "winmm"` 一眼就懂。
+
+`Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping` 是**可读性**修复，不是正确性修复。默认的 `JavaScriptEncoder.Default` 会把所有非 ASCII 转成 `\uXXXX`，而这几份文件里的人话内容几乎全是中文：`IdentityDecision.UserPromptMessage`（一整段解释 OptiScaler 的代理转发到 System32 而不是游戏目录内那份 DLL）、`UpscalerProfile.DisplayName`/`Description`、`PlanWarning.Message`、`GameTitle`，分别落在 `manifest.json`、`plan.json`、`profiles.json`、`ledger.json` 里。上一段刚用 `WriteIndented` + 字符串枚举论证过「这些文件是给人打开来读的」，转义正好把这个理由打掉。`\u5149` 与 `光` 反序列化完全等价，所以这不是 bug；放宽也安全，因为输出只落 `.json` 文件、从不内联进 HTML。今天 CI 看不见它，只是因为还没有测试把中文字符串推过一遍 JSON（Step 7 补上了）。
+
+`MakeReadOnly` 把这个单例冻住：`{ get; }` 只防重新赋值，对象本身仍是可变的，一句杂散的 `DeployerJson.Options.WriteIndented = false;` 就会静默重排五种落盘文件的格式——而 `JsonAssert.Equivalent` 两边用的是同一份 `Options`，两边一起变，测试照样绿。.NET 8 的两个坑记在这里：`MakeReadOnly()` 返回 `void`，串不进属性初始化表达式；无参重载还要求先指定 `TypeInfoResolver`，否则直接抛 `InvalidOperationException`，所以要传 `populateMissingResolver: true`。
 
 - [x] **Step 3: 写 `Util/Hashing.cs`**
 
@@ -840,6 +889,8 @@ namespace Deployer.Core.Util;
 
 public static class Hashing
 {
+    private const int HexLength = 64;
+
     /// <summary>返回小写十六进制 SHA256。经 IFileSystem 读，因此 MockFileSystem 上照样能算。</summary>
     public static string Sha256OfFile(IFileSystem fs, string path)
     {
@@ -854,8 +905,13 @@ public static class Hashing
         Sha256OfBytes(Encoding.UTF8.GetBytes(text));
 
     /// <summary>取 SHA256 前 <paramref name="length"/> 位十六进制小写，用于短指纹。</summary>
-    public static string ShortHash(string text, int length) =>
-        Sha256OfString(text)[..length];
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> 不在 [1, 64] 区间内。</exception>
+    public static string ShortHash(string text, int length)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(length, HexLength);
+        return Sha256OfString(text)[..length];
+    }
 }
 ```
 
@@ -961,13 +1017,41 @@ public class HashingTests
 
         Assert.Equal(Hashing.Sha256OfBytes(bytes), Hashing.Sha256OfFile(fs, path));
     }
+
+    // FIPS 180-2 的已知答案，一句断言同时钉住「算法 + UTF-8 编码 + 小写十六进制」三件事。
+    // 之所以不能漂：GameTarget.Fingerprint 由 Sha256OfString 推出，并作为影子备份的目录名
+    // 与台账索引键落盘；换掉编码会让所有既有备份静默失联 —— 用户看到「未安装」，
+    // 而备份其实躺在另一个指纹底下。
+    [Fact]
+    public void Sha256OfString_matches_the_fips_known_answer()
+    {
+        Assert.Equal("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                     Hashing.Sha256OfString("abc"));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(65)]
+    public void ShortHash_rejects_length_outside_one_to_sixty_four(int length)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => Hashing.ShortHash("abc", length));
+    }
+
+    [Theory]
+    [InlineData(1, "b")]
+    [InlineData(64, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")]
+    public void ShortHash_accepts_the_boundary_lengths(int length, string expected)
+    {
+        Assert.Equal(expected, Hashing.ShortHash("abc", length));
+    }
 }
 ```
 
 - [x] **Step 6: 跑测试，确认失败**
 
 Run: `dotnet test OptiScalerDeployer.sln`
-Expected: **FAIL** —— `HashingTests` 编译不过（`Hashing` 尚未存在）。若 Step 3 已写完则会直接通过；此时改为确认 `通过: 13`。
+Expected: **FAIL** —— `HashingTests` 编译不过（`Hashing` 尚未存在）。若 Step 3 已写完则会直接通过；此时改为确认 `通过: 19`。
 
 - [x] **Step 7: 写 `JsonAssert.cs` 与 `DeployerJsonTests.cs`**
 
@@ -1071,15 +1155,100 @@ public class DeployerJsonTests
 
         JsonAssert.Equivalent(manifest, restored);
     }
+
+    [Fact]
+    public void Chinese_text_is_written_readable_not_escaped()
+    {
+        var json = DeployerJson.Serialize(new PlanWarning(WarningSeverity.Caution, "身份 DLL 全部冲突"));
+
+        Assert.Contains("身份 DLL 全部冲突", json);
+        Assert.DoesNotContain("\\u", json);
+    }
+
+    // 这些名字是 manifest.json 与 ledger.json 的**落盘契约**：改个成员名或改拼写，
+    // 旧 manifest 就反序列化不出来；BackupStore.ReadJson 会把它吞成 null；RollbackExecutor
+    // 接着报「读不到备份 manifest，可能已损坏或被删」—— 一次纯重构就这样静默且永久地
+    // 毁掉用户的回滚能力，而报错信息还指错了方向。
+    // 真要改，必须同时给 SchemaVersion 加兼容分支，并有意识地更新本测试。
+    [Theory]
+    [InlineData(typeof(PayloadOrigin), "localBuild", "gitHubRelease", "manualDirectory")]
+    [InlineData(typeof(DllIdentity), "dxgi", "winmm", "version", "dbghelp", "d3d12", "wininet", "winhttp", "asi")]
+    [InlineData(typeof(IdentityStatus), "resolved", "requiresUserDecision", "noCandidateAvailable")]
+    [InlineData(typeof(BackupReason), "overwriteGameFile", "overwritePreviousOpti", "iniModified")]
+    [InlineData(typeof(InstallState), "installed", "healthy", "rolledBack", "needsReinstall", "failed")]
+    public void Persisted_enum_wire_names_are_pinned(Type enumType, params string[] expectedWireNames)
+    {
+        var actualWireNames = Enum.GetValues(enumType)
+            .Cast<object>()
+            .Select(value => DeployerJson.Serialize(value).Trim('"'))
+            .ToArray();
+
+        Assert.Equal(expectedWireNames, actualWireNames);
+    }
 }
 ```
 
 注意这里用的是 `JsonAssert.Equivalent` 而不是 `Assert.Equal`：`DeploymentManifest` 含四个集合成员（`Identity.SkippedDueToConflict`、`Profile.Edits`、`Backups`、`WrittenPaths`），直接用 `Assert.Equal` 会因引用相等而失败。上一项 `GameTarget_roundtrips` 用 `Assert.Equal` 是对的，因为 `GameTarget` 全是 string 与 enum，没有集合成员。
 
+两个新测试分别钉住 Step 2 的两项保证：`Chinese_text_is_written_readable_not_escaped` 是 `UnsafeRelaxedJsonEscaping` 的唯一看守人（没有它，谁把 `Encoder` 删了测试也照样绿）；`Persisted_enum_wire_names_are_pinned` 钉住落盘枚举名。后者的预期值是**实测**出来的，不是拍脑袋：`JsonNamingPolicy.CamelCase` 对开头连续大写的降位方式有它自己的规矩（`GitHubRelease` → `gitHubRelease`，而不是 `githubRelease`）。将来对不上时，先确认 `DeployerJson` 真实产出的是什么，再去改**预期值**；绝不得把断言改宽。
+
+`DeployerJson.Serialize(value)` 在 `value` 静态类型为 `object` 时仍按**运行时类型**序列化，所以箱起来的枚举能正常走到 `JsonStringEnumConverter`（已实测，与 `JsonSerializer.Serialize(value, enumType, Options)` 逐字节一致）。若哪天不再成立，改用后者那个显式运行时类型的调用，**不要**为测试往 `DeployerJson` 里加新方法。
+
+- [x] **Step 7b: 写 `WindowsFileVersionReaderTests.cs`**
+
+`FileVersionInfo` 走的是 Win32 版本资源 API，作用不到 `MockFileSystem` 上——这正是 Step 4 抽 `IFileVersionReader` 的理由，也是本文件成为全套里**唯一**碰真文件系统的测试的原因。只测否定路径：仓库里没有 PE 二进制夹具，正向路径无从造起；而否定路径是确定性的，也恰好就是 Task 7 保守分支依赖的契约（「读不出来 → 返回 null，绝不抛」→ 该槽位被当作游戏自带文件，宁可收进影子备份也不静默覆盖）。
+
+```csharp
+using Deployer.Core.Abstractions;
+using Xunit;
+
+namespace Deployer.Core.Tests;
+
+// 本文件是整套测试里唯一碰真文件系统的，这是正确且无法回避的：FileVersionInfo 走的是
+// Win32 版本资源 API，作用不到 MockFileSystem 上 —— 这正是 IFileVersionReader 存在的理由。
+// 只测否定路径（仓库里没有 PE 二进制夹具，正向路径无从造起）。否定路径是确定性的，
+// 也恰好就是任务 7 保守分支依赖的契约：「读不出来就返回 null、绝不抛」→ 该槽位被当作
+// 游戏自带文件，宁可收进影子备份，也不静默覆盖。
+public class WindowsFileVersionReaderTests
+{
+    private readonly WindowsFileVersionReader reader = new();
+
+    [Fact]
+    public void Missing_file_returns_null_instead_of_throwing()
+    {
+        // 目录本身也不存在，因此 File.Exists 必为 false
+        var missing = Path.Combine(Path.GetTempPath(), "opti-deployer-tests-no-such-dir", "no-such-file.dll");
+
+        Assert.Null(reader.GetOriginalFilename(missing));
+        Assert.Null(reader.GetFileVersion(missing));
+    }
+
+    [Fact]
+    public void Non_PE_file_returns_null_instead_of_throwing()
+    {
+        var notAPe = Path.Combine(Path.GetTempPath(), $"opti-deployer-tests-{Guid.NewGuid():N}.txt");
+
+        try
+        {
+            File.WriteAllText(notAPe, "这不是 PE 文件，只是一段普通文本。");
+
+            Assert.Null(reader.GetOriginalFilename(notAPe));
+        }
+        finally
+        {
+            // 断言失败也要清干净，别在 temp 里留垃圾
+            File.Delete(notAPe);
+        }
+    }
+}
+```
+
+`finally` 里的 `File.Delete` 是必须的：断言一失败就会抛出，没 `finally` 就会在用户的 temp 目录里留下孤儿文件。临时文件名带 `Guid.NewGuid()`，因此并行跑测试也不会互撞。
+
 - [x] **Step 8: 跑测试**
 
 Run: `dotnet test OptiScalerDeployer.sln`
-Expected: `失败: 0，通过: 16`
+Expected: `失败: 0，通过: 30`
 
 若 `Manifest_roundtrips` 失败，先看 xUnit 的差异输出：如果所有标量字段都相等、只有集合的**运行时类型**不同（`T[]` vs `List<T>`），那不是元素不等，而是你把它写成了 `Assert.Equal`——record 对 `IReadOnlyList<T>` 字段是引用相等（详见 Step 7 的 `JsonAssert` 注释），改用 `JsonAssert.Equivalent` 即可。只有在元素**值**真的不同时，才去查 `IniEdit` / `BackupEntry` 是不是漏了 `record` 关键字（被写成了 `class`）。
 

@@ -40,4 +40,32 @@ public class HashingTests
 
         Assert.Equal(Hashing.Sha256OfBytes(bytes), Hashing.Sha256OfFile(fs, path));
     }
+
+    // FIPS 180-2 的已知答案，一句断言同时钉住「算法 + UTF-8 编码 + 小写十六进制」三件事。
+    // 之所以不能漂：GameTarget.Fingerprint 由 Sha256OfString 推出，并作为影子备份的目录名
+    // 与台账索引键落盘；换掉编码会让所有既有备份静默失联 —— 用户看到「未安装」，
+    // 而备份其实躺在另一个指纹底下。
+    [Fact]
+    public void Sha256OfString_matches_the_fips_known_answer()
+    {
+        Assert.Equal("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                     Hashing.Sha256OfString("abc"));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(65)]
+    public void ShortHash_rejects_length_outside_one_to_sixty_four(int length)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => Hashing.ShortHash("abc", length));
+    }
+
+    [Theory]
+    [InlineData(1, "b")]
+    [InlineData(64, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")]
+    public void ShortHash_accepts_the_boundary_lengths(int length, string expected)
+    {
+        Assert.Equal(expected, Hashing.ShortHash("abc", length));
+    }
 }
