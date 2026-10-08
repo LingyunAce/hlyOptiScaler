@@ -166,13 +166,13 @@ Expected: 无输出，`Test-Path "tools\OptiScalerDeployer\src"` 为 `True`
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <AnalysisLevel>8.0</AnalysisLevel>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
 </Project>
 ```
 
-`CA1416`（Windows 平台兼容性）必须全局关掉：本产品是 Windows 专用工具，`Core` 却定 `net8.0`（而非 `net8.0-windows`）以便测试宿主轻量。`WindowsFileVersionReader` 会用到 `System.Diagnostics.FileVersionInfo`，不关这条会被 `TreatWarningsAsErrors` 直接判死。**不要**用 `#pragma warning disable` 逐处压制——那是把全局决策散落成局部噪音。
+`AnalysisLevel` 钉死在 `8.0`：它默认解析为 `latest`，意味着分析器规则集会随本机装了哪个 SDK 而漂移，叠上 `TreatWarningsAsErrors=true` 就会制造「代码一行没动、构建突然红」的故障；钉版本让规则集可复现。**不要**再加 `AnalysisMode`（`Recommended` 会打开一批额外规则，在本工程里等于一批新的硬错误），保持隐式默认。`CA1416`（Windows 平台兼容性）**不做任何压制**：本产品确实是 Windows 专用工具、`Core` 却定 `net8.0`（而非 `net8.0-windows`）以便测试宿主轻量，但原计划据此认为 `WindowsFileVersionReader`（Task 3）用到的 `System.Diagnostics.FileVersionInfo` 会触发 CA1416，已在 SDK 8.0.425 上实测证伪——.NET 8 的 `FileVersionInfo` 并未标注 `[SupportedOSPlatform("windows")]`，因此不产生 CA1416，无需任何 suppression 即可干净编译；而一条没有事实依据的全局 `NoWarn` 一旦写下，后面的代码会长在它上面，就再也摘不掉了。若将来真的引入 Windows 专有 API（Plan D 的注册表 / `WindowsApps` 访问），正确机制是在**那个**程序集上加 `[assembly: SupportedOSPlatform("windows")]`，而不是全局 `NoWarn`；同样**不要**用 `#pragma warning disable` 逐处压制——那是把全局决策散落成局部噪音。
 
 - [ ] **Step 4: 写 `.gitignore`**
 
@@ -199,7 +199,31 @@ Expected: 四次 `The template ... was created successfully.`
 
 `dotnet new` 生成的 csproj 已含 `TargetFramework`，但**不含** Step 3 里那些公共开关之外的东西——需要手工覆盖成下面的内容。
 
-- [ ] **Step 6: 覆盖四个 csproj**
+- [ ] **Step 6: 写 `Directory.Packages.props`，并覆盖四个 csproj**
+
+**6a. `tools/OptiScalerDeployer/Directory.Packages.props`（集中包版本管理，CPM）：**
+```xml
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="System.IO.Abstractions" Version="21.0.29" />
+    <PackageVersion Include="System.IO.Abstractions.TestingHelpers" Version="21.0.29" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageVersion Include="xunit" Version="2.9.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+</Project>
+```
+
+这个文件守的是一条**类型同一性**不变式：`System.IO.Abstractions` 与 `System.IO.Abstractions.TestingHelpers` 必须在所有项目里解析到完全相同的版本，否则 `MockFileSystem`（来自 TestingHelpers）与 `IFileSystem`（来自 Abstractions）会落在两个不同的程序集版本上而类型不兼容。危险在于失败模式：NuGet 对版本*冲突*只做静默向上统一（只有降级才报 NU1605），所以版本不一致既不报错也不警告，只在**运行期**炸成一个难懂的类型身份异常。把版本硬写在四个 csproj 里、仅靠人肉纪律保持一致是不可接受的，CPM 让这条不变式由构建机械保证。
+
+开启 CPM 后，csproj 里的 `<PackageReference>` **不能再带 `Version` 属性**（带了就是 NU1008 错误），所以下面四个 csproj 一律只写 `Include`。
+
+**不要**加 `<CentralPackageTransitivePinningEnabled>`：`TestableIO.*` 那些传递依赖的版本本来就由 `System.IO.Abstractions` 自己精确锁定，开它收益几乎为零，反而带来 NU1605 降级错误的风险。
+
+**6b. 四个 csproj：**
 
 `src/Deployer.Core/Deployer.Core.csproj`：
 ```xml
@@ -209,7 +233,7 @@ Expected: 四次 `The template ... was created successfully.`
     <RootNamespace>Deployer.Core</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="System.IO.Abstractions" Version="21.0.29" />
+    <PackageReference Include="System.IO.Abstractions" />
   </ItemGroup>
 </Project>
 ```
@@ -220,10 +244,11 @@ Expected: 四次 `The template ... was created successfully.`
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>Deployer.TestData</RootNamespace>
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="System.IO.Abstractions" Version="21.0.29" />
-    <PackageReference Include="System.IO.Abstractions.TestingHelpers" Version="21.0.29" />
+    <PackageReference Include="System.IO.Abstractions" />
+    <PackageReference Include="System.IO.Abstractions.TestingHelpers" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Deployer.Core\Deployer.Core.csproj" />
@@ -240,11 +265,11 @@ Expected: 四次 `The template ... was created successfully.`
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
-    <PackageReference Include="xunit" Version="2.9.2" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
-    <PackageReference Include="System.IO.Abstractions" Version="21.0.29" />
-    <PackageReference Include="System.IO.Abstractions.TestingHelpers" Version="21.0.29" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="System.IO.Abstractions" />
+    <PackageReference Include="System.IO.Abstractions.TestingHelpers" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Deployer.Core\Deployer.Core.csproj" />
@@ -263,7 +288,7 @@ Expected: 四次 `The template ... was created successfully.`
     <AssemblyName>opti-deploy</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="System.IO.Abstractions" Version="21.0.29" />
+    <PackageReference Include="System.IO.Abstractions" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Deployer.Core\Deployer.Core.csproj" />
@@ -271,7 +296,7 @@ Expected: 四次 `The template ... was created successfully.`
 </Project>
 ```
 
-包版本已核实为 .NET 8 兼容的当前稳定版。若 `dotnet restore` 报某个版本不存在，用 `dotnet package search System.IO.Abstractions --take 1` 查实际最新版并**四处同步替换**（版本必须在四个 csproj 间一致，否则 `MockFileSystem` 与 `IFileSystem` 会来自不同程序集而类型不兼容）。
+包版本已核实为 .NET 8 兼容的当前稳定版。若 `dotnet restore` 报某个版本不存在，用 `dotnet package search System.IO.Abstractions --take 1` 查实际最新版，然后**只改 `Directory.Packages.props` 这一个地方**——CPM 之下四个 csproj 根本不含版本号，既不需要、也不允许再去「四处同步替换」（真在 csproj 里写 `Version` 会直接报 NU1008）。注意 `System.IO.Abstractions` 与 `System.IO.Abstractions.TestingHelpers` 必须一起改成同一个版本，理由见 6a。
 
 - [ ] **Step 7: 建 sln 并挂载**
 
@@ -303,7 +328,7 @@ Expected: build `0 个警告 / 0 个错误`（`0 Warning(s) 0 Error(s)`）；tes
 删除 `tests/Deployer.Core.Tests/UnitTest1.cs`。
 
 Run: `dotnet test OptiScalerDeployer.sln`
-Expected: `已通过! - 失败: 0，通过: 0`（零测试也算成功）
+Expected: **退出码 0**（PowerShell 里 `$LASTEXITCODE` 为 0）——这是唯一的通过判据。测试程序集此刻零个测试，VSTest 17.11.1 只会打印一行 `...\Deployer.Core.Tests.dll 中没有可用测试。请确保已注册测试发现器和执行器且平台和框架版本设置合理，然后重试。`，并且**不会**打印 `已通过! - 失败: 0，通过: 0` 那样的汇总行。看不到「已通过」不等于失败，别去「修」它。
 
 - [ ] **Step 10: Commit**
 
