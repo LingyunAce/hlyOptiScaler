@@ -1358,7 +1358,7 @@ Spec §8.2 的核心约束：**不重新序列化**。`OptiScaler.ini` 1571 行�
 已核实的文件事实（决定实现细节；下面每个数字都用脚本对真文件实测过）：
 - 行尾是 **CRLF**（`crlf=1571 bareLf=0`，零混合行尾）、UTF-8 **无 BOM**
 - **864 / 1571 = 55% 是注释行**。这就是「不重新序列化」从「比较好」变成「硬约束」的原因
-- **零行内注释**：所有 `;` 注释都独占一行。因此「替换 `=` 右侧」不会误删注释。**这条事实只对当前这份仓库根的 `OptiScaler.ini` 成立**：被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 枚举含 `manualDirectory`（用户可以指定任意本地目录作为 payload），换一份 ini 不保证仍然零行内注释——参见下面「行尾注释会被一并替换掉」那条已知限制
+- **零行内注释**：所有 `;` 注释都独占一行。因此「替换 `=` 右侧」不会误删注释。**这条事实只对当前这份仓库根的 `OptiScaler.ini` 成立**：被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 枚举含 `ManualDirectory`（用户可以指定任意本地目录作为 payload），换一份 ini 不保证仍然零行内注释——参见下面「行尾注释会被一并替换掉」那条已知限制
 - 键的写法**绝大多数**是 `Key=value`（等号两侧无空格），但有 3 个例外：`[NvngxFG]` 段的 `DispatchFlags` / `ShowDebug` / `DisableHudless` 写作 `Key = auto`（实测 L721 / L726 / L731）。所以「只换 `=` 右侧、左半部分原样保留」这条路径在真文件里**确实会走到**，不是纯理论构造
 - **同一 section 内零重复键**（实测）。所以「命中即 `pending.Remove`」不会漏改；若将来 OptiScaler 上游引入了重复键，本实现只改**第一次出现**的那个，而 OptiScaler 自己的 SimpleIni 可能读到最后一个——那种不一致会表现为「改了但没生效」，需重新评估
 - `Enabled=auto` 这个键名在 **5 个不同的 section** 里各出现一次：`[FrameGen]` L25、`[DLSS]` L664、`[OutputScaling]` L1154、`[CAS]` L1172、`[Magnifier]` L1234（全文 37 个 section，section 名零重复）—— **section 作用域匹配是硬性要求，不是优化**：不分作用域就会一次改掉五个不相干的功能开关
@@ -1852,7 +1852,7 @@ public class IniPatcherTests
         // 于是往文件末尾追加出**第二个** [Log] 段——与「先 Trim 归一化」那条防的是同一个
         // 失效模式，只是入口从 edit 侧换成了文件侧。
         // 既有的 Section_and_key_with_surrounding_whitespace… 只覆盖 edit 侧带空格。
-        // 真 ini 实测 paddedHeaders=0，但被 patch 的 ini 可能来自 manualDirectory。
+        // 真 ini 实测 paddedHeaders=0，但被 patch 的 ini 可能来自 ManualDirectory。
         const string ini = "[ Log ]\r\nLogToFile=auto\r\n";
         var patcher = new IniPatcher();
 
@@ -2270,7 +2270,7 @@ Expected: 记下三个数字（`1571` / `864` / `37`）。计划 B 之后会有�
 **计划 B 真 INI 回归测试的三条硬信息**（上一轮实施者在真 ini 上实测得到，届时必须落实）：
 1. **必须探测至少 2 个 section**：`[Upscalers]` 作为文件第一个 section，在锚点前移缺陷下**不会**漂移（它前面没有别的 section 插入去触发前移），单探它抓不到跨段错位。
 2. **必须加 `tailNonBlank` 断言**：「追加键之后到下一个 section 头之间只能是空白行或同批 probe」。上一轮实测：只有「行数对、注释数对、超序列对、键仍在正确 section 内、`OldValue` 为 null」这 5 条断言时，在锚点前移缺陷下**全部通过**（真文件 section 够长，10 条追加最大漂移仅 8 行）；加了 `tailNonBlank` 才炸出 8 处 ANCHOR DRIFT。
-3. **应额外覆盖一个最短的 section，并用真 ini 验证注释重数断言**：`All_comment_lines_survive_verbatim` 的「带重数」强度在 `Sample` 上尚未被真正激发（Sample 里三条注释行互不相同）；真 ini 里最常见的那条 `; ----` 横幅精确重复 **75** 次（形似横幅的行共 78 条，另有 3 条长度略不同的变体各出现 1 次），届时才会兑现。
+3. **应额外覆盖一个最短的 section，并用真 ini 验证注释重数断言**：`All_comment_lines_survive_verbatim` 的「带重数」强度在 `Sample` 上尚未被真正激发（Sample 里的注释行互不相同，没有任何一条重复）；真 ini 里最常见的那条 `; ----` 横幅精确重复 **75** 次（形似横幅的行共 78 条，另有 3 条长度略不同的变体各出现 1 次），届时才会兑现。
 
 - [x] **Step 7: Commit**
 

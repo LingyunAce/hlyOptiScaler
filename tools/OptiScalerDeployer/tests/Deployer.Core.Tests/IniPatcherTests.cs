@@ -453,7 +453,7 @@ public class IniPatcherTests
         // 于是往文件末尾追加出**第二个** [Log] 段——与「先 Trim 归一化」那条防的是同一个
         // 失效模式，只是入口从 edit 侧换成了文件侧。
         // 既有的 Section_and_key_with_surrounding_whitespace… 只覆盖 edit 侧带空格。
-        // 真 ini 实测 paddedHeaders=0，但被 patch 的 ini 可能来自 manualDirectory。
+        // 真 ini 实测 paddedHeaders=0，但被 patch 的 ini 可能来自 ManualDirectory。
         const string ini = "[ Log ]\r\nLogToFile=auto\r\n";
         var patcher = new IniPatcher();
 
