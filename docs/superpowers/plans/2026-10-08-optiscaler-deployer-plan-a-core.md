@@ -1366,7 +1366,7 @@ Spec §8.2 的核心约束：**不重新序列化**。`OptiScaler.ini` 1571 行�
 - Create: `src/Deployer.Core/Ini/IniPatcher.cs`
 - Test: `tests/Deployer.Core.Tests/IniPatcherTests.cs`
 
-- [ ] **Step 1: 写 `Ini/IIniPatcher.cs`**
+- [x] **Step 1: 写 `Ini/IIniPatcher.cs`**
 
 ```csharp
 using Deployer.Core.Domain;
@@ -1391,7 +1391,7 @@ public interface IIniPatcher
 
 `AppliedEdits`（命中原有键、就地替换）与 `AppendedEdits`（原文件没这个键、追加到 section 末尾）分开返回，因为 UI 预演要把两者用不同措辞展示：前者是「改动」，后者是「新增」。两者的 `OldValue` 都已回填（追加项的 `OldValue` 为 `null`）。
 
-- [ ] **Step 2: 写 `Ini/IniPatcher.cs` 的失败测试**
+- [x] **Step 2: 写 `Ini/IniPatcher.cs` 的失败测试**
 
 `tests/Deployer.Core.Tests/IniPatcherTests.cs`：
 ```csharp
@@ -1608,12 +1608,12 @@ public class IniPatcherTests
 
 「左半部分原样保留」这条（`Dx12Upscaler =ffx`）看着别扭，但它正是**最小干预**的体现：我们只动 `=` 右边，绝不重排用户的空格。真实的 `OptiScaler.ini` 全部是 `Key=value` 无空格，所以这个别扭情况实际不会出现；测试钉住它是为了防实现悄悄开始重新格式化整行。
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter IniPatcherTests`
 Expected: 编译错误 `IniPatcher 不存在`
 
-- [ ] **Step 4: 写 `Ini/IniPatcher.cs`**
+- [x] **Step 4: 写 `Ini/IniPatcher.cs`**
 
 ```csharp
 using System.Text;
@@ -1795,12 +1795,12 @@ public sealed class IniPatcher : IIniPatcher
 
 **`LastContentLineIndex` 存在的理由**：若直接用「下一个 section 头的前一行」作为插入点，而那一行是分隔用的空行，新键就会落在空行之后、与 section 本体隔开。功能上仍正确（还在同一个 section 里），但人读起来像是另一个区块。
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter IniPatcherTests`
 Expected: `失败: 0，通过: 13`
 
-- [ ] **Step 6: 用真 INI 做一次人工核对**
+- [x] **Step 6: 用真 INI 做一次人工核对**
 
 这一步不是单测，是防止「测试全绿但真文件被改坏」。
 
@@ -1815,7 +1815,7 @@ $origComments = $orig | Where-Object { $_.TrimStart().StartsWith(';') -or $_.Tri
 ```
 Expected: 记下三个数字（`1571` / 注释行数 / `36`）。计划 B 之后会有针对真 INI 的回归测试；此处仅建立基线。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add tools/OptiScalerDeployer
