@@ -1735,7 +1735,8 @@ public sealed class IniPatcher : IIniPatcher
         }
 
         // 后出现的 edit 覆盖先出现的（"last one wins"），但顺序按**首次出现**的位置保留。
-        // 不能直接靠 pending.Values 的枚举顺序：Dictionary 一旦 Remove 过就不再保证插入序。
+        // 不能直接靠 pending.Values 的枚举顺序：Dictionary 一旦 Remove 过，插入序就不再由
+        // 规范保证（.NET 8 实测幸存键的相对顺序不变，但那是实现细节、不是契约）。
         var pending = new Dictionary<(string Section, string Key), IniEdit>(KeyComparer.Instance);
         var orderedKeys = new List<(string Section, string Key)>();
         foreach (var edit in edits)
