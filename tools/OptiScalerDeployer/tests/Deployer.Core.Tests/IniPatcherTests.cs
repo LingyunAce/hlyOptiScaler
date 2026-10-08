@@ -84,6 +84,10 @@ public class IniPatcherTests
         // 所以超序列要比的是「已应用就地替换后的输入行」。直接拿原始 Sample 的行去比是恒假的：
         // Dx12Upscaler=auto 本来就不应该出现在输出里。这里把预期改动显式写成映射，
         // 于是断言仍然要求：左侧原样保留、其余每一行逐字原样且顺序不变。
+        //
+        // 与 All_comment_lines_survive_verbatim 是**互补**的、不可互相替代：超序列断言天然容忍重复，
+        // 「把每条注释行复制一份」这类变异它**抓不到**（要靠后者的有序带重数比对）；反过来后者只看注释行，
+        // 删掉一个非注释行它不红，那要靠这条超序列断言。别以为其中一条冗余而删掉它。
         var survivingInputLines = Sample
             .Split("\r\n")
             .Select(l => l switch
@@ -118,6 +122,9 @@ public class IniPatcherTests
         // 有序 + 带重数的比对。旧写法 Assert.Contains(comment, outputLines) 是**集合包含**：
         // 真 OptiScaler.ini 里 `; ----` 横幅重复了几十次（L1/L3/L19/L21 完全相同），
         // 删掉其中三条只要还剩一条相同的就照样绿。排掉 AddedByDeployer 是因为它是新增的注释。
+        // 与 Output_preserves_every_input_line_in_order 是**互补**的：本条只看注释行、且要求有序带重数，
+        // 是唯一能抓到「把每条注释行复制一份」这类变异的一条（超序列断言天然容忍重复，抓不到它）；
+        // 反过来删掉一个非注释行只有那条超序列断言能抓到。别以为其中一条冗余而删掉它。
         Assert.Equal(originalComments, outputComments);
     }
 
@@ -214,6 +221,64 @@ public class IniPatcherTests
         });
 
         Assert.Equal("[A]\r\nA1=1\r\nX1=1\r\nX2=2\r\n\r\n[B]\r\nB1=1\r\nY=9\r\n", result.Content);
+    }
+
+    [Fact]
+    public void Appends_shift_anchors_of_empty_sections_too()
+    {
+        // 钉住前移循环的比较符边界：`>= anchorLine + 1` 写成 `> anchorLine + 1` 的话，
+        // 当**别的** section 的锚点值恰好等于 anchorLine + 1 时那个锚点会被漏掉前移。
+        // 这种撞值只在两个 section 头**紧邻**时发生（中间的 [B] 是个没有任何键行的空段，
+        // 它的锚点就是它自己那一行头）。上面那条两 section 看守的 fixture 里每段都有键行，
+        // 锚点值不可能撞上这个边界，所以盖不到——而漏掉前移的后果与刚修掉的那个 Critical
+        // 完全同型：Y=9 会落进 [A] 段，静默。
+        const string ini = "[A]\r\nA1=1\r\n[B]\r\n[C]\r\nJ=1\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[]
+        {
+            Edit("A", "X1", "1"),
+            Edit("A", "X2", "2"),
+            Edit("B", "Y", "9"),
+        });
+
+        Assert.Equal("[A]\r\nA1=1\r\nX1=1\r\nX2=2\r\n[B]\r\nY=9\r\n[C]\r\nJ=1\r\n", result.Content);
+    }
+
+    [Fact]
+    public void Insert_into_earlier_section_after_creating_a_new_one_keeps_both_anchors_correct()
+    {
+        // 覆盖「先新建 section、再往前面既有 section 插入」这条路径：新建走 lines.Add 并写下
+        // 锚点，随后向 [Upscalers] 插入会让**所有** >= 插入点的锚点（包括刚写下的 Spoofing）
+        // 整体前移；第三条 edit 再往 [Spoofing] 追加时必须落在 Dxgi=false 之后。
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(Sample, new[]
+        {
+            Edit("Spoofing", "Dxgi", "false"),      // section 不存在 -> 新建，走 lines.Add
+            Edit("Upscalers", "BrandNewKey", "1"),  // 往前面的既有 section 插入 -> 触发整体前移
+            Edit("Spoofing", "Other", "2"),         // 再往刚新建的 section 追加
+        });
+
+        Assert.Equal(
+            "; OptiScaler config\r\n" +
+            "[Upscalers]\r\n" +
+            "; fsr21, fsr22, ffx, dlss\r\n" +
+            "Dx12Upscaler=auto\r\n" +
+            "BrandNewKey=1\r\n" +
+            "\r\n" +
+            "[FrameGen]\r\n" +
+            "Enabled=auto\r\n" +
+            "\r\n" +
+            "[Log]\r\n" +
+            "LogToFile=auto\r\n" +
+            "LogLevel=auto\r\n" +
+            "\r\n" +
+            "; added by OptiScaler Deployer\r\n" +
+            "[Spoofing]\r\n" +
+            "Dxgi=false\r\n" +
+            "Other=2\r\n",
+            result.Content);
     }
 
     [Fact]
@@ -378,6 +443,25 @@ public class IniPatcherTests
         Assert.Equal("[A]\r\nX=1\r\nK=9\r\n[B] ; note\r\nK=2\r\n", result.Content);
         Assert.Single(result.AppendedEdits);
         Assert.Empty(result.AppliedEdits);
+    }
+
+    [Fact]
+    public void Section_header_with_inner_padding_is_trimmed_before_matching()
+    {
+        // 文件侧的 `[ Log ]`：TryReadSectionHeader 必须 trim 内侧空白，否则 currentSection
+        // 会是 " Log "，与 edit 的 "Log" 匹配不上（OrdinalIgnoreCase 救不了空格差异），
+        // 于是往文件末尾追加出**第二个** [Log] 段——与「先 Trim 归一化」那条防的是同一个
+        // 失效模式，只是入口从 edit 侧换成了文件侧。
+        // 既有的 Section_and_key_with_surrounding_whitespace… 只覆盖 edit 侧带空格。
+        // 真 ini 实测 paddedHeaders=0，但被 patch 的 ini 可能来自 manualDirectory。
+        const string ini = "[ Log ]\r\nLogToFile=auto\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("Log", "LogToFile", "true") });
+
+        Assert.Equal("[ Log ]\r\nLogToFile=true\r\n", result.Content);
+        Assert.Single(result.AppliedEdits);
+        Assert.Empty(result.AppendedEdits);
     }
 
     [Fact]

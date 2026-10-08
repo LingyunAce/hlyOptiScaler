@@ -1483,6 +1483,10 @@ public class IniPatcherTests
         // 所以超序列要比的是「已应用就地替换后的输入行」。直接拿原始 Sample 的行去比是恒假的：
         // Dx12Upscaler=auto 本来就不应该出现在输出里。这里把预期改动显式写成映射，
         // 于是断言仍然要求：左侧原样保留、其余每一行逐字原样且顺序不变。
+        //
+        // 与 All_comment_lines_survive_verbatim 是**互补**的、不可互相替代：超序列断言天然容忍重复，
+        // 「把每条注释行复制一份」这类变异它**抓不到**（要靠后者的有序带重数比对）；反过来后者只看注释行，
+        // 删掉一个非注释行它不红，那要靠这条超序列断言。别以为其中一条冗余而删掉它。
         var survivingInputLines = Sample
             .Split("\r\n")
             .Select(l => l switch
@@ -1517,6 +1521,9 @@ public class IniPatcherTests
         // 有序 + 带重数的比对。旧写法 Assert.Contains(comment, outputLines) 是**集合包含**：
         // 真 OptiScaler.ini 里 `; ----` 横幅重复了几十次（L1/L3/L19/L21 完全相同），
         // 删掉其中三条只要还剩一条相同的就照样绿。排掉 AddedByDeployer 是因为它是新增的注释。
+        // 与 Output_preserves_every_input_line_in_order 是**互补**的：本条只看注释行、且要求有序带重数，
+        // 是唯一能抓到「把每条注释行复制一份」这类变异的一条（超序列断言天然容忍重复，抓不到它）；
+        // 反过来删掉一个非注释行只有那条超序列断言能抓到。别以为其中一条冗余而删掉它。
         Assert.Equal(originalComments, outputComments);
     }
 
@@ -1613,6 +1620,64 @@ public class IniPatcherTests
         });
 
         Assert.Equal("[A]\r\nA1=1\r\nX1=1\r\nX2=2\r\n\r\n[B]\r\nB1=1\r\nY=9\r\n", result.Content);
+    }
+
+    [Fact]
+    public void Appends_shift_anchors_of_empty_sections_too()
+    {
+        // 钉住前移循环的比较符边界：`>= anchorLine + 1` 写成 `> anchorLine + 1` 的话，
+        // 当**别的** section 的锚点值恰好等于 anchorLine + 1 时那个锚点会被漏掉前移。
+        // 这种撞值只在两个 section 头**紧邻**时发生（中间的 [B] 是个没有任何键行的空段，
+        // 它的锚点就是它自己那一行头）。上面那条两 section 看守的 fixture 里每段都有键行，
+        // 锚点值不可能撞上这个边界，所以盖不到——而漏掉前移的后果与刚修掉的那个 Critical
+        // 完全同型：Y=9 会落进 [A] 段，静默。
+        const string ini = "[A]\r\nA1=1\r\n[B]\r\n[C]\r\nJ=1\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[]
+        {
+            Edit("A", "X1", "1"),
+            Edit("A", "X2", "2"),
+            Edit("B", "Y", "9"),
+        });
+
+        Assert.Equal("[A]\r\nA1=1\r\nX1=1\r\nX2=2\r\n[B]\r\nY=9\r\n[C]\r\nJ=1\r\n", result.Content);
+    }
+
+    [Fact]
+    public void Insert_into_earlier_section_after_creating_a_new_one_keeps_both_anchors_correct()
+    {
+        // 覆盖「先新建 section、再往前面既有 section 插入」这条路径：新建走 lines.Add 并写下
+        // 锚点，随后向 [Upscalers] 插入会让**所有** >= 插入点的锚点（包括刚写下的 Spoofing）
+        // 整体前移；第三条 edit 再往 [Spoofing] 追加时必须落在 Dxgi=false 之后。
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(Sample, new[]
+        {
+            Edit("Spoofing", "Dxgi", "false"),      // section 不存在 -> 新建，走 lines.Add
+            Edit("Upscalers", "BrandNewKey", "1"),  // 往前面的既有 section 插入 -> 触发整体前移
+            Edit("Spoofing", "Other", "2"),         // 再往刚新建的 section 追加
+        });
+
+        Assert.Equal(
+            "; OptiScaler config\r\n" +
+            "[Upscalers]\r\n" +
+            "; fsr21, fsr22, ffx, dlss\r\n" +
+            "Dx12Upscaler=auto\r\n" +
+            "BrandNewKey=1\r\n" +
+            "\r\n" +
+            "[FrameGen]\r\n" +
+            "Enabled=auto\r\n" +
+            "\r\n" +
+            "[Log]\r\n" +
+            "LogToFile=auto\r\n" +
+            "LogLevel=auto\r\n" +
+            "\r\n" +
+            "; added by OptiScaler Deployer\r\n" +
+            "[Spoofing]\r\n" +
+            "Dxgi=false\r\n" +
+            "Other=2\r\n",
+            result.Content);
     }
 
     [Fact]
@@ -1777,6 +1842,25 @@ public class IniPatcherTests
         Assert.Equal("[A]\r\nX=1\r\nK=9\r\n[B] ; note\r\nK=2\r\n", result.Content);
         Assert.Single(result.AppendedEdits);
         Assert.Empty(result.AppliedEdits);
+    }
+
+    [Fact]
+    public void Section_header_with_inner_padding_is_trimmed_before_matching()
+    {
+        // 文件侧的 `[ Log ]`：TryReadSectionHeader 必须 trim 内侧空白，否则 currentSection
+        // 会是 " Log "，与 edit 的 "Log" 匹配不上（OrdinalIgnoreCase 救不了空格差异），
+        // 于是往文件末尾追加出**第二个** [Log] 段——与「先 Trim 归一化」那条防的是同一个
+        // 失效模式，只是入口从 edit 侧换成了文件侧。
+        // 既有的 Section_and_key_with_surrounding_whitespace… 只覆盖 edit 侧带空格。
+        // 真 ini 实测 paddedHeaders=0，但被 patch 的 ini 可能来自 manualDirectory。
+        const string ini = "[ Log ]\r\nLogToFile=auto\r\n";
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(ini, new[] { Edit("Log", "LogToFile", "true") });
+
+        Assert.Equal("[ Log ]\r\nLogToFile=true\r\n", result.Content);
+        Assert.Single(result.AppliedEdits);
+        Assert.Empty(result.AppendedEdits);
     }
 
     [Fact]
@@ -2050,11 +2134,20 @@ public sealed class IniPatcher : IIniPatcher
     /// 从 <paramref name="from"/> 往前找最后一个非空白行，作为该 section 的追加锚点。
     /// </summary>
     /// <remarks>
-    /// 注意**注释行算内容**：真 OptiScaler.ini 里很多 section 末尾有 `; ----` 横幅，
-    /// 新键会落在横幅**之后**而不是紧贴最后一个真实键。这是有意的——横幅在语义上属于
-    /// 它上面那个 section 的收尾，把新键插在横幅与它描述的键之间才是真的拆散了注释。
-    /// 全是空白行时返回 -1；调用处那个 `>= 0` 判断在当前所有路径下恒为真（三个写入点
-    /// 都保证了非负），留着是防将来有人新增一个可能写入 -1 的路径。
+    /// 注意**注释行算内容**：向既有 section 追加时，新键会落在该段末尾的注释块**之后**，而不是紧贴
+    /// 最后一个真实键。在真 OptiScaler.ini 上这表现为：37 个 section 头**全部**是「`; ----` 横幅 /
+    /// `[Header]` / 横幅」三明治（实测 immediatelyAboveHeader=37、immediatelyBelowHeader=37），所以
+    /// 某个头**上方**那条横幅是**那个头的开头装饰**，不是上一个 section 的收尾（决定性反证：L1 的横幅
+    /// 在文件第一行，上方根本没有任何 section）。于是新键会落在「下一个 section 的开头横幅之后、它的
+    /// `[Header]` 之前」——section 作用域不破（新键仍在下一个头之前，文件仍合法、解析器读得对），但
+    /// 人读起来像是属于下一个 section：这是已知的**观感退化**，不是正确性缺陷。
+    /// 不改成「锚到最后一个真实键行」，是因为它对末尾 section 更糟：`[Hotfix]`（最后一段）的最后一个
+    /// 真实键 `OutputResourceBarrier=auto`（L1551）之后跟着 21 行文档注释块（L1553..L1571，以一条
+    /// Microsoft 文档 URL 收尾），跳过末尾注释会把新键楔进那个键与解释它的注释之间。两种规则都不是
+    /// 普遍更优，都是在猜「末尾注释块属于上面还是下面」，而这份文件里两种情况都真实存在，故保持现规则
+    /// 并记进已知限制。
+    /// 返回 `-1` 的唯一情形是 `from` 之前全是空白行；调用处那个 `>= 0` 判断在当前所有路径下恒为真
+    /// （三个写入点都保证了非负），是一段死防御，留着防将来新增一个可能写入 `-1` 的路径。
     /// </remarks>
     private static int LastContentLineIndex(List<string> lines, int from)
     {
@@ -2126,13 +2219,15 @@ public sealed class IniPatcher : IIniPatcher
 
 **为什么正序插入而不用 `Reverse()`**：每插入一行就把 `sectionAppendAnchor[section]` 推到新行的位置，下一条自然排在它后面——正序遍历直接得到正确结果，逆序反而会颠倒。
 
-**插入之后必须把插入点之后所有 section 的锚点整体前移一行**：`sectionAppendAnchor` 里的下标是扫描阶段对着**未修改**的 `lines` 记下来的，而追加阶段用 `lines.Insert(anchorLine + 1, …)` 改的是同一个列表。插入使插入点之后的每一行都下移一行，所以**每一个** `>= anchorLine + 1` 的锚点都过期了，不只是当前 section 的那一个。只更新当前 section 的话，后面所有 section 的锚点各偏差 1，偏差还会随追加次数累积：偏差 ≥ 1 时新键不再落在 section 末尾，还可能插进一个注释块与它所解释的键之间把两者拆散（在一份 55% 是注释的文件里这是用户可见的退化）；偏差累积到超过该 section 的长度时，新键会落到 section 头**之前**，也就是写进了上一个 section——直接击穿类头 `<remarks>` 第 2 条声称的 section 作用域硬性要求。实测：输入 `[Upscalers]\r\nDx12Upscaler=auto\r\n\r\n[FrameGen]\r\nEnabled=auto\r\n` + edits `(Upscalers,New1,1) (Upscalers,New2,2) (FrameGen,New3,3)`，`New3=3` 会跑到 `[FrameGen]` 头之前、也就是写进了 `[Upscalers]`。实现上必须先 `sectionAppendAnchor.ToArray()` 拿快照再遍历：`Dictionary` 的枚举器会校验 `_version`，而索引器赋值会递增它，边枚举边写会抛 `InvalidOperationException`。section 总数最多几十个，整体扫一遍的代价可以忽略。「新建 section」分支走的是 `lines.Add(...)`，往列表末尾追加不会让任何既有锚点失效，所以**不需要**这个处理。回归看守是 `Appends_into_two_different_existing_sections_both_land_at_their_own_section_end`（既有的追加测试全都只碰一个 section，盖不到）。
+**插入之后必须把插入点之后所有 section 的锚点整体前移一行**：`sectionAppendAnchor` 里的下标是扫描阶段对着**未修改**的 `lines` 记下来的，而追加阶段用 `lines.Insert(anchorLine + 1, …)` 改的是同一个列表。插入使插入点之后的每一行都下移一行，所以**每一个** `>= anchorLine + 1` 的锚点都过期了，不只是当前 section 的那一个。只更新当前 section 的话，后面所有 section 的锚点各偏差 1，偏差还会随追加次数累积：偏差 ≥ 1 时新键不再落在 section 末尾，还可能插进一个注释块与它所解释的键之间把两者拆散（在一份 55% 是注释的文件里这是用户可见的退化）；偏差累积到超过该 section 的长度时，新键会落到 section 头**之前**，也就是写进了上一个 section——直接击穿类头 `<remarks>` 第 2 条声称的 section 作用域硬性要求。实测：输入 `[Upscalers]\r\nDx12Upscaler=auto\r\n\r\n[FrameGen]\r\nEnabled=auto\r\n` + edits `(Upscalers,New1,1) (Upscalers,New2,2) (FrameGen,New3,3)`，`New3=3` 会跑到 `[FrameGen]` 头之前、也就是写进了 `[Upscalers]`。实现上先 `sectionAppendAnchor.ToArray()` 拿快照再遍历。**注意 net8.0 实测纠正一处旧假断言**：`Dictionary` 的枚举器确实校验 `_version`，但索引器 setter 走 `TryInsert(..., updateVersion: false)`——**更新已有键不递增 `_version`、不会抛**（探针 `foreach (var kv in dd) { dd[kv.Key] = kv.Value + 1; }` 实测 `n=3 threw=none`），只有**插入新键**才递增并抛 `InvalidOperationException`（探针 `dd[kv.Key + "z"] = 9` 实测 `n=1 threw=InvalidOperationException`）。本前移循环里 `pair.Key` 必然是已有键（只在既有锚点表上前移），所以 `.ToArray()` 快照当前**不是必需**的；保留它是为了防止将来有人在循环里写出「可能新增键」的形式，那时就会真的抛。**别因为「去掉快照的变异没被杀死」就去删它**（与 `orderedKeys` 的处置同理：防御性正确、开销可忽略）。section 总数最多几十个，整体扫一遍的代价可以忽略。「新建 section」分支走的是 `lines.Add(...)`，往列表末尾追加不会让任何既有锚点失效，所以**不需要**这个处理。回归看守是 `Appends_into_two_different_existing_sections_both_land_at_their_own_section_end`（既有的追加测试全都只碰一个 section，盖不到）。
 
-**`LastContentLineIndex` 存在的理由**：若直接用「下一个 section 头的前一行」作为插入点，而那一行是分隔用的空行，新键就会落在空行之后、与 section 本体隔开。功能上仍正确（还在同一个 section 里），但人读起来像是另一个区块。注意它只跳**纯空白行**，`; ----` 这样的注释横幅算内容、会成为锚点，所以新键落在横幅**之后**——这是有意的，横幅在语义上属于它上面那个 section 的收尾，把新键插在横幅与它描述的键之间才是真的拆散了注释。它在全是空白行时返回 `-1`，而调用处那个 `anchorLine >= 0` 判断在当前所有路径下恒为真（三个写入点都保证了非负），是一段死防御，留着只为防将来新增一个可能写入 `-1` 的路径。
+**`LastContentLineIndex` 存在的理由**：若直接用「下一个 section 头的前一行」作为插入点，而那一行是分隔用的空行，新键就会落在空行之后、与 section 本体隔开。功能上仍正确（还在同一个 section 里），但人读起来像是另一个区块。注意它只跳**纯空白行**，`; ----` 这样的注释横幅算内容、会成为锚点，所以新键落在横幅**之后**。**这里曾有一处假断言，现按实测纠正**：真 `OptiScaler.ini` 的 37 个 section 头**全部**是「横幅 / `[Header]` / 横幅」三明治（实测 `immediatelyAboveHeader=37`、`immediatelyBelowHeader=37`），所以某个头**上方**那条横幅是**那个头的开头装饰**，不是上一个 section 的收尾——决定性反证：L1 的横幅位于文件第一行，上方根本没有任何 section。后果是：向既有 section 追加时，新键会落在「下一个 section 的开头横幅之后、它的 `[Header]` 之前」。section 作用域不破（新键仍在下一个头之前，INI 解析器读得对、文件仍合法），但人读起来像是属于下一个 section——这是已知的**观感退化**，不是正确性缺陷。它在全是空白行时返回 `-1`，而调用处那个 `anchorLine >= 0` 判断在当前所有路径下恒为真（三个写入点都保证了非负），是一段死防御，留着只为防将来新增一个可能写入 `-1` 的路径。
+
+**为什么不改成「锚到最后一个真实键行」（跳过末尾注释与空白）**：再复核曾建议此修法，控制器实测后**驳回**，裁定为终审、行为一律不动。理由：（1）对 section 1..36（后面都跟着一个被横幅夹住的头）这个改法确实更好，但对最后一个 section `[Hotfix]`（L1483）它会把新键楔进「L1551 `OutputResourceBarrier=auto` 与那 21 行解释它的文档注释块（L1553..L1571，以一条 Microsoft 文档 URL 收尾）」之间——正是本计划自己判定为「用户可见退化、不可接受」的形状。（2）`zeroKeySections=0`，所以这个改法需要的 `floor`（section 头下界）参数在出厂 payload 上**根本不会被触发**，它只为 `PayloadOrigin.ManualDirectory` 指向的任意 ini 存在，却要冒在刚修好 Critical 的锚点逻辑里引入正确性回归的风险，去换一个纯观感问题。（3）Task 9 的 `BuildIniEdits` 还没写，此刻并不知道实际会往哪些 section 追加；信息不足时把启发式钉死是错的。**两种规则都不是普遍更优**，都是在猜「末尾注释块属于上面还是下面」，而这份文件里两种情况都真实存在（37/37 个头被夹住 vs `[Hotfix]` 的 21 行尾部文档块）。故保持现规则、把取舍写进已知限制，把「锚点启发式」推迟到**计划 B**处置（届时真 ini 回归测试与 Task 9 的实际 edit 集合都已知）。
 
 **section 头怎么解析**：判定抽在私有方法 `TryReadSectionHeader` 里，规则与通行 INI 解析器对齐——以 `[` 开头、扫到**第一个** `]` 为止，`]` 之后的内容（行内注释）一律忽略，内侧空白 trim 掉；没有 `]` 就返回 `false`，整行由调用方跳过。
 
-为什么 `]` 之后允许有内容：`[Log] ; 只写日志` 是完全合法的 INI 写法。旧判定 `trimmed.StartsWith('[') && trimmed.TrimEnd().EndsWith(']')` 要求 `]` 必须在行尾，于是这一行既不是 section 头、又没有 `=`，被当成空行跳过——`currentSection` 保持不变，后面所有键被归到**上一个** section 名下。两个后果都是静默的：其一，针对 `A` 段的 edit 会改到物理上位于 `B` 段的那个同名键（实测 `[A]\r\nX=1\r\n[B] ; note\r\nK=2\r\n` + edit `(A,K,"9")` 会把 `B` 段的 `K=2` 改成 `K=9`）；其二，针对 `B` 段的 edit 匹配不上，于是往文件末尾追加出**第二个** `[B]` 段。可达性：仓库根的真 `OptiScaler.ini` 37 个 section 头全部干净，但被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 含 `manualDirectory`——用户可以指定任意本地目录作为 payload。
+为什么 `]` 之后允许有内容：`[Log] ; 只写日志` 是完全合法的 INI 写法。旧判定 `trimmed.StartsWith('[') && trimmed.TrimEnd().EndsWith(']')` 要求 `]` 必须在行尾，于是这一行既不是 section 头、又没有 `=`，被当成空行跳过——`currentSection` 保持不变，后面所有键被归到**上一个** section 名下。两个后果都是静默的：其一，针对 `A` 段的 edit 会改到物理上位于 `B` 段的那个同名键（实测 `[A]\r\nX=1\r\n[B] ; note\r\nK=2\r\n` + edit `(A,K,"9")` 会把 `B` 段的 `K=2` 改成 `K=9`）；其二，针对 `B` 段的 edit 匹配不上，于是往文件末尾追加出**第二个** `[B]` 段。可达性：仓库根的真 `OptiScaler.ini` 37 个 section 头全部干净，但被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 含 `ManualDirectory`——用户可以指定任意本地目录作为 payload。
 
 为什么没有 `]` 时整行跳过而不是当键解析：`[Foo=bar` 会被 `IndexOf('=')` 解析成键名 `[Foo`，那是在往游戏文件里制造一个谁也不认识的键。这是一处**有意的行为改变**（旧实现会当键解析）。其余分支与旧实现逐一核对过等价：`[ Section ]` → trim 后 `Section`；`[]` → 空 section 名；`[Sec[tion]` → 取第一个 `]`，得 `Sec[tion`（旧的 `[1..^1]` 对同一输入也得 `Sec[tion`）。
 
@@ -2142,7 +2237,7 @@ public sealed class IniPatcher : IIniPatcher
 
 为什么这里选 Trim 而空白仍然抛 `ArgumentException`：两者防的是不同的东西。前后多打空格是**意图明确、错误可恢复**的——用户想改的就是 `Log` 段，Trim 之后的行为正是他想要的，不该让整次部署失败；而 Section / Key 全空白是**意图不可恢复**的，无从猜测用户想改哪个段哪个键，只能报错让他改 profile。注意 `Blank_key_is_rejected` 传的 `"   "` 经 Trim 后变成 `""`，仍会被守卫拒绝，那条测试继续通过。
 
-**为什么 `SplitLines` 改成按 `\n` 切再剥掉行尾 `\r`**：若按检测到的主导 `newLine` 切，一个以 CRLF 为主、却夹了几行 bare LF 的文件，那几行会被并进相邻的同一个「行」字符串里。例如 `[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n` 会被切成 `["[Upscalers]", "Foo=1\nDx12Upscaler=auto"]`，于是针对 `Dx12Upscaler` 的 edit 实际匹配到的是 `Foo`。失效方向是**静默漏改**：`Join` 能原样还原所以文件不会被写坏，但「配置改了却没生效」是最难排查的一类失败。代价是输出会把零星 bare LF 归一化成主导行尾——这是对「最小干预」的一次有意识让步，换取的是「不会静默漏改」。仓库根目录的真 `OptiScaler.ini` 实测 `crlf=1571 bareLf=0`，但**这不能推广到实际被 patch 的那份文件**：被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 枚举含 `manualDirectory`——用户可以指定任意本地目录作为 payload，那份 ini 可能来自任何地方（被用户手改过、从别的机器拷来、被某个编辑器重存过）；而且不同 OptiScaler 版本的 ini 行尾也不保证一致。加固本身仍然正确，只是威胁模型要说准，不能窄化成「用户拿 Unix 编辑器手改过」这一条路径；纯 CRLF 与纯 LF 两种文件在改动前后行为完全一致（加固改动前的既有测试全部保持绿）。
+**为什么 `SplitLines` 改成按 `\n` 切再剥掉行尾 `\r`**：若按检测到的主导 `newLine` 切，一个以 CRLF 为主、却夹了几行 bare LF 的文件，那几行会被并进相邻的同一个「行」字符串里。例如 `[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n` 会被切成 `["[Upscalers]", "Foo=1\nDx12Upscaler=auto"]`，于是针对 `Dx12Upscaler` 的 edit 实际匹配到的是 `Foo`。失效方向是**静默漏改**：`Join` 能原样还原所以文件不会被写坏，但「配置改了却没生效」是最难排查的一类失败。代价是输出会把零星 bare LF 归一化成主导行尾——这是对「最小干预」的一次有意识让步，换取的是「不会静默漏改」。仓库根目录的真 `OptiScaler.ini` 实测 `crlf=1571 bareLf=0`，但**这不能推广到实际被 patch 的那份文件**：被 patch 的 ini 来自 `Payload.RootDirectory`，而 `PayloadOrigin` 枚举含 `ManualDirectory`——用户可以指定任意本地目录作为 payload，那份 ini 可能来自任何地方（被用户手改过、从别的机器拷来、被某个编辑器重存过）；而且不同 OptiScaler 版本的 ini 行尾也不保证一致。加固本身仍然正确，只是威胁模型要说准，不能窄化成「用户拿 Unix 编辑器手改过」这一条路径；纯 CRLF 与纯 LF 两种文件在改动前后行为完全一致（加固改动前的既有测试全部保持绿）。
 
 **这条 `ArgumentException` 在下游怎么呈现**：它从 `IniPatcher.Patch` 抛出，穿过纯函数 planner、executor，最终由 Task 15 CLI 顶层那句 `return Fail(ex.Message, ex)` 打到 stderr——消息里带着 `Section=""`/`Key=""` 的实际值，正好是用户手改 profile JSON 时定位错误所需的线索，所以**不需要**再包一层 `DeployerException`（包了只会把这条线索换成一句更泛的话术）。计划 C 的 WPF UI 需遵守同一条：把这个异常的消息原文呈现给用户，而不是显示成「未知错误」。
 
@@ -2150,10 +2245,12 @@ public sealed class IniPatcher : IIniPatcher
 
 **匹配到的键行，其 `=` 右侧的行尾注释会被一并替换掉**：`K=1 ; keep me` 被改成 `K=9`，`; keep me` 消失。这在契约上不算违约（`IIniPatcher` 承诺的是「所有**以** `;` 或 `#` **开头**的行原样保留」，行尾注释不在承诺范围内），且真 payload ini 实测零行内注释，故当前不可达。**不做保留是有意的**：通行 INI 解析器很可能把值后面的 `;` 视为值的一部分，拼回去会让 OptiScaler 读到 `"9 ; keep me"` 而解析失败——那比丢一条注释严重得多，失效方向更糟。（`external/simpleini` 是未初始化的子模块，本地无源码可查证，所以这里不凭猜测改行为。）
 
+**追加键的落点是观感退化（不是正确性缺陷）**：向既有 section 追加新键时，因为 `LastContentLineIndex` 把末尾注释块算作内容、且真 `OptiScaler.ini` 的 37 个 section 头全部是「横幅 / `[Header]` / 横幅」三明治，新键会落在**下一个 section 的开头横幅与其 `[Header]` 之间**。section 作用域不破（新键仍物理位于下一个头之前，INI 解析器把它归给上一个 section、文件仍合法、OptiScaler 读得对），只是人读起来像是属于下一个 section。这在真 payload 上向既有 section 追加时是**常态**而非边角情形：36/36 个段间间隔（37 个头两两相邻）**全部**以横幅结尾，所以每一次跨段追加都会命中。处置：**行为不动**（理由见上文「为什么不改成锚到最后一个真实键行」的终审裁定），把这类**观感降级**记为 **Task 9 `Warnings` 通道**的典型候选条目——由 planner 报给 UI 让用户知情，而不是在 `IniPatcher` 这一层单方面加通道（`IniPatchResult` 的 `Warnings` 已裁定推迟到 Task 9）。
+
 - [x] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter IniPatcherTests`
-Expected: `失败: 0，通过: 23`
+Expected: `失败: 0，通过: 26`
 
 - [x] **Step 6: 用真 INI 做一次人工核对**
 
@@ -2169,6 +2266,11 @@ $origComments = $orig | Where-Object { $_.TrimStart().StartsWith(';') -or $_.Tri
 "原文件 section 数: $(($orig | Where-Object { $_ -match '^\s*\[' }).Count)"
 ```
 Expected: 记下三个数字（`1571` / `864` / `37`）。计划 B 之后会有针对真 INI 的回归测试；此处仅建立基线。三个数字已由控制器独立实测确认。
+
+**计划 B 真 INI 回归测试的三条硬信息**（上一轮实施者在真 ini 上实测得到，届时必须落实）：
+1. **必须探测至少 2 个 section**：`[Upscalers]` 作为文件第一个 section，在锚点前移缺陷下**不会**漂移（它前面没有别的 section 插入去触发前移），单探它抓不到跨段错位。
+2. **必须加 `tailNonBlank` 断言**：「追加键之后到下一个 section 头之间只能是空白行或同批 probe」。上一轮实测：只有「行数对、注释数对、超序列对、键仍在正确 section 内、`OldValue` 为 null」这 5 条断言时，在锚点前移缺陷下**全部通过**（真文件 section 够长，10 条追加最大漂移仅 8 行）；加了 `tailNonBlank` 才炸出 8 处 ANCHOR DRIFT。
+3. **应额外覆盖一个最短的 section，并用真 ini 验证注释重数断言**：`All_comment_lines_survive_verbatim` 的「带重数」强度在 `Sample` 上尚未被真正激发（Sample 里三条注释行互不相同）；真 ini 里 `; ----` 横幅精确重复 78 次，届时才会兑现。
 
 - [x] **Step 7: Commit**
 
@@ -4768,6 +4870,8 @@ public sealed class DeploymentPlanner : IDeploymentPlanner
 ```
 
 **为什么 `resolvedEdits` 用的是 patch 后的结果而不是 `BuildIniEdits` 的输出**：前者 `OldValue` 已回填（能渲染 `auto → ffx` 的 diff），后者 `OldValue` 全为 null。UI 预演必须用前者。
+
+**`IniPatchResult` 若加 `Warnings` 通道（Task 9 设计输入）**：已裁定 `IniPatchResult` 不在 `IniPatcher` 这一层单方面加 `Warnings`，而是推迟到 Task 9、与既有 `PlanWarning`（`WarningSeverity` / `Message`）协调统一走 planner 的 `BuildWarnings`。「追加键落在下一个 section 的开头装饰块里」这类**观感降级**（详见 Task 4 已知限制：真 ini 37 个头全被横幅夹住，跨段追加时新键会楔进下一段的开头横幅与其 `[Header]` 之间，section 作用域不破、文件仍合法）是典型候选条目——由 planner 汇成一条 Info/Caution 级 `PlanWarning` 报给 UI 让用户知情，而不是在 patcher 层静默处理。
 
 **为什么 `BuildWarnings` 要收 `backups` 参数**：「将覆盖 N 个游戏自带文件」这条警告的数据是 planner 自己在算 `Writes` 时产生的，`PlanRequest` 里根本没有。往 `PlanRequest` 上挂一个辅助方法去查备份只会把数据流弄反。
 
