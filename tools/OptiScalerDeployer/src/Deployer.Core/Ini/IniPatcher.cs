@@ -8,9 +8,9 @@ namespace Deployer.Core.Ini;
 /// 1. **不重新序列化**是设计文档 §8.2 的硬约束，不是风格偏好。真 OptiScaler.ini
 ///    共 1571 行，其中 864 行（55%）是注释；任何现成 INI 库（SimpleIni / IniParser）
 ///    在解析-回写时都会把注释整片丢掉。所以这里坚持逐行文本改写，绝不 round-trip。
-/// 2. **section 作用域匹配是硬性要求**。同一个键名 Enabled=auto 在真文件里分属 4 个
-///    不同 section（[FrameGen] L25、[OutputScaling] L1154、[CAS] L1172、[Magnifier] L1234）。
-///    不按 section 限定，一条 edit 就会一次改掉四个毫不相干的功能开关。
+/// 2. **section 作用域匹配是硬性要求**。同一个键名 Enabled=auto 在真文件里分属 5 个
+///    不同 section（[FrameGen] L25、[DLSS] L664、[OutputScaling] L1154、[CAS] L1172、
+///    [Magnifier] L1234）。不按 section 限定，一条 edit 就会一次改掉五个毫不相干的功能开关。
 /// 3. **只替换 = 右侧**：左半部分（键名连同用户原有的空格）原样保留，这是最小干预的直接体现。
 /// </remarks>
 public sealed class IniPatcher : IIniPatcher

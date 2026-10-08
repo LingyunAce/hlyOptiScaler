@@ -1359,9 +1359,9 @@ Spec §8.2 的核心约束：**不重新序列化**。`OptiScaler.ini` 1571 行�
 - 行尾是 **CRLF**（`crlf=1571 bareLf=0`，零混合行尾）、UTF-8 **无 BOM**
 - **864 / 1571 = 55% 是注释行**。这就是「不重新序列化」从「比较好」变成「硬约束」的原因
 - **零行内注释**：所有 `;` 注释都独占一行。因此「替换 `=` 右侧」不会误删注释
-- 键的写法是 `Key=value`（等号两侧无空格）
+- 键的写法**绝大多数**是 `Key=value`（等号两侧无空格），但有 3 个例外：`[NvngxFG]` 段的 `DispatchFlags` / `ShowDebug` / `DisableHudless` 写作 `Key = auto`（实测 L721 / L726 / L731）。所以「只换 `=` 右侧、左半部分原样保留」这条路径在真文件里**确实会走到**，不是纯理论构造
 - **同一 section 内零重复键**（实测）。所以「命中即 `pending.Remove`」不会漏改；若将来 OptiScaler 上游引入了重复键，本实现只改**第一次出现**的那个，而 OptiScaler 自己的 SimpleIni 可能读到最后一个——那种不一致会表现为「改了但没生效」，需重新评估
-- `Enabled=auto` 这个键名在 **4 个不同的 section** 里各出现一次：`[FrameGen]` L25、`[OutputScaling]` L1154、`[CAS]` L1172、`[Magnifier]` L1234（全文 37 个 section，section 名零重复）—— **section 作用域匹配是硬性要求，不是优化**：不分作用域就会一次改掉四个不相干的功能开关
+- `Enabled=auto` 这个键名在 **5 个不同的 section** 里各出现一次：`[FrameGen]` L25、`[DLSS]` L664、`[OutputScaling]` L1154、`[CAS]` L1172、`[Magnifier]` L1234（全文 37 个 section，section 名零重复）—— **section 作用域匹配是硬性要求，不是优化**：不分作用域就会一次改掉五个不相干的功能开关
 
 **Files:**
 - Create: `src/Deployer.Core/Ini/IIniPatcher.cs`
@@ -1646,10 +1646,40 @@ public class IniPatcherTests
         Assert.Equal("auto", result.AppliedEdits[0].OldValue);
         Assert.Equal("[Upscalers]\r\nFoo=1\r\nDx12Upscaler=ffx\r\n", result.Content);
     }
+
+    [Fact]
+    public void Appended_keys_keep_edit_order_even_when_other_edits_matched_in_place()
+    {
+        // 钉住的是**可观察契约**：追加顺序 = 这些 edit 在入参里首次出现的顺序，
+        // 与「同一批里有多少条是就地命中」无关。就地命中会触发 pending.Remove，
+        // 而实现刻意不依赖 Dictionary 删除后的枚举序（见下方 orderedKeys 的说明）。
+        // 既有的 Several_keys_appended… 是纯追加场景，从不 Remove，盖不到这条。
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(Sample, new[]
+        {
+            Edit("Log", "Zzz", "3"),
+            Edit("Upscalers", "Dx12Upscaler", "ffx"),  // 就地命中，触发 Remove
+            Edit("Log", "Aaa", "1"),
+            Edit("Log", "LogLevel", "2"),              // 又一处就地命中
+            Edit("Log", "Mmm", "2"),
+        });
+
+        Assert.Equal(2, result.AppliedEdits.Count);
+        Assert.Equal(3, result.AppendedEdits.Count);
+
+        var body = result.Content.Split(result.DetectedNewLine);
+        var iZzz = Array.IndexOf(body, "Zzz=3");
+        var iAaa = Array.IndexOf(body, "Aaa=1");
+        var iMmm = Array.IndexOf(body, "Mmm=2");
+
+        Assert.True(iZzz >= 0 && iZzz < iAaa && iAaa < iMmm,
+            $"追加顺序应为 Zzz、Aaa、Mmm（实际下标 {iZzz}, {iAaa}, {iMmm}）");
+    }
 }
 ```
 
-「左半部分原样保留」这条（`Dx12Upscaler =ffx`）看着别扭，但它正是**最小干预**的体现：我们只动 `=` 右边，绝不重排用户的空格。真实的 `OptiScaler.ini` 全部是 `Key=value` 无空格，所以这个别扭情况实际不会出现；测试钉住它是为了防实现悄悄开始重新格式化整行。
+「左半部分原样保留」这条（`Dx12Upscaler =ffx`）看着别扭，但它正是**最小干预**的体现：我们只动 `=` 右边，绝不重排用户的空格。这**不是**纯理论构造：真 `OptiScaler.ini` 里 `[NvngxFG]` 段的 L721 `DispatchFlags = auto`、L726 `ShowDebug = auto`、L731 `DisableHudless = auto` 就是等号两侧带空格的（实测）。它们目前不在任何 profile 的 edits 里，但用户手写 profile JSON 时完全可能碰到；而测试钉住这条主要是为了防实现悄悄开始重新格式化整行。
 
 - [x] **Step 3: 跑测试确认失败**
 
@@ -1669,9 +1699,9 @@ namespace Deployer.Core.Ini;
 /// 1. **不重新序列化**是设计文档 §8.2 的硬约束，不是风格偏好。真 OptiScaler.ini
 ///    共 1571 行，其中 864 行（55%）是注释；任何现成 INI 库（SimpleIni / IniParser）
 ///    在解析-回写时都会把注释整片丢掉。所以这里坚持逐行文本改写，绝不 round-trip。
-/// 2. **section 作用域匹配是硬性要求**。同一个键名 Enabled=auto 在真文件里分属 4 个
-///    不同 section（[FrameGen] L25、[OutputScaling] L1154、[CAS] L1172、[Magnifier] L1234）。
-///    不按 section 限定，一条 edit 就会一次改掉四个毫不相干的功能开关。
+/// 2. **section 作用域匹配是硬性要求**。同一个键名 Enabled=auto 在真文件里分属 5 个
+///    不同 section（[FrameGen] L25、[DLSS] L664、[OutputScaling] L1154、[CAS] L1172、
+///    [Magnifier] L1234）。不按 section 限定，一条 edit 就会一次改掉五个毫不相干的功能开关。
 /// 3. **只替换 = 右侧**：左半部分（键名连同用户原有的空格）原样保留，这是最小干预的直接体现。
 /// </remarks>
 public sealed class IniPatcher : IIniPatcher
@@ -1871,6 +1901,8 @@ public sealed class IniPatcher : IIniPatcher
 
 **为什么用 `orderedKeys` 而不直接遍历 `pending.Values`**：`Dictionary` 在不删除时保持插入序，但本实现在命中时会 `Remove`，之后顺序就不再可靠。用一个显式的 `List` 记住首次出现顺序，比依赖未文档化的容器行为稳。
 
+**关于「`orderedKeys` 杀不死变异」**：把 `foreach (var key in orderedKeys)` 改成 `foreach (var key in pending.Keys.ToList())`，全部测试依旧绿——这**不是覆盖缺口，是等价变异体**。.NET 8 的 `Dictionary.Remove` 只把槽位标记为空闲并挂进 freeList，**不压缩** `_entries` 数组；`KeyCollection` 枚举器按下标 `0.._count` 线性扫并跳过已释放的槽，所以删除之后**幸存键的相对顺序不变**。本实现又只在最初那一个 `foreach` 里往 `pending` 加键（之后再无 Add），freeList 复用无从发生，两者逐输入行为相同。`orderedKeys` 仍然要留：它把「顺序 = 首次出现顺序」这个意图写成**结构**，而不是寄望于运行时实现细节；哪天有人改成边扫边 Add、或者换个容器，寄望就会失效。`Appended_keys_keep_edit_order_even_when_other_edits_matched_in_place` 钉住的是可观察契约（混合命中与追加时的顺序），它杀不死上面那个等价变异体，但契约真被破坏时会变红。**别因为「变异没被杀死」就去删 `orderedKeys` 或那条测试。**
+
 **为什么正序插入而不用 `Reverse()`**：每插入一行就把 `sectionLastLineIndex[section]` 推到新行的位置，下一条自然排在它后面——正序遍历直接得到正确结果，逆序反而会颠倒。
 
 **`LastContentLineIndex` 存在的理由**：若直接用「下一个 section 头的前一行」作为插入点，而那一行是分隔用的空行，新键就会落在空行之后、与 section 本体隔开。功能上仍正确（还在同一个 section 里），但人读起来像是另一个区块。
@@ -1886,7 +1918,7 @@ public sealed class IniPatcher : IIniPatcher
 - [x] **Step 5: 跑测试确认通过**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter IniPatcherTests`
-Expected: `失败: 0，通过: 16`
+Expected: `失败: 0，通过: 17`
 
 - [x] **Step 6: 用真 INI 做一次人工核对**
 

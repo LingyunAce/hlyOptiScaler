@@ -247,4 +247,34 @@ public class IniPatcherTests
         Assert.Equal("auto", result.AppliedEdits[0].OldValue);
         Assert.Equal("[Upscalers]\r\nFoo=1\r\nDx12Upscaler=ffx\r\n", result.Content);
     }
+
+    [Fact]
+    public void Appended_keys_keep_edit_order_even_when_other_edits_matched_in_place()
+    {
+        // 钉住的是**可观察契约**：追加顺序 = 这些 edit 在入参里首次出现的顺序，
+        // 与「同一批里有多少条是就地命中」无关。就地命中会触发 pending.Remove，
+        // 而实现刻意不依赖 Dictionary 删除后的枚举序（见下方 orderedKeys 的说明）。
+        // 既有的 Several_keys_appended… 是纯追加场景，从不 Remove，盖不到这条。
+        var patcher = new IniPatcher();
+
+        var result = patcher.Patch(Sample, new[]
+        {
+            Edit("Log", "Zzz", "3"),
+            Edit("Upscalers", "Dx12Upscaler", "ffx"),  // 就地命中，触发 Remove
+            Edit("Log", "Aaa", "1"),
+            Edit("Log", "LogLevel", "2"),              // 又一处就地命中
+            Edit("Log", "Mmm", "2"),
+        });
+
+        Assert.Equal(2, result.AppliedEdits.Count);
+        Assert.Equal(3, result.AppendedEdits.Count);
+
+        var body = result.Content.Split(result.DetectedNewLine);
+        var iZzz = Array.IndexOf(body, "Zzz=3");
+        var iAaa = Array.IndexOf(body, "Aaa=1");
+        var iMmm = Array.IndexOf(body, "Mmm=2");
+
+        Assert.True(iZzz >= 0 && iZzz < iAaa && iAaa < iMmm,
+            $"追加顺序应为 Zzz、Aaa、Mmm（实际下标 {iZzz}, {iAaa}, {iMmm}）");
+    }
 }
