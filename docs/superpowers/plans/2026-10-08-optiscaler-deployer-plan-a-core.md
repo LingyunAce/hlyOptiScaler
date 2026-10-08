@@ -1877,7 +1877,11 @@ public sealed class IniPatcher : IIniPatcher
 
 **为什么空 Section / 空 Key 是硬错误而不是「匹配不上就跳过」**：`currentSection` 初值是 `string.Empty`，一条 Section 为空白的 edit 会静默命中第一个 section 头之前的前言区；若没命中，就落进「新建 section」分支，往用户的 `OptiScaler.ini` 末尾追加一个 `[]` 段——那是往游戏文件里写垃圾，直接违背「绝不损坏游戏文件」这条第一承诺。Key 为空白同理，会命中任何以 `=` 开头的畸形行。失效方向是**静默写入垃圾**，所以必须抛 `ArgumentException` 而不是当作未命中。守卫放在 `IniPatcher` 而非调用方：它是真正落笔改游戏文件的那一层，而 edits 可能来自用户自己写的 profile JSON（Task 5 的 `JsonProfileStore` 从磁盘读），放在这最后一道关口才能同时覆盖 builtins、用户 JSON 与任何未来的调用方；Task 9 的 `BuildIniEdits` 因此不再重复校验。
 
-**为什么 `SplitLines` 改成按 `\n` 切再剥掉行尾 `\r`**：若按检测到的主导 `newLine` 切，一个以 CRLF 为主、却夹了几行 bare LF 的文件（用户拿 Unix 编辑器手改过就会这样），那几行会被并进相邻的同一个「行」字符串里。例如 `[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n` 会被切成 `["[Upscalers]", "Foo=1\nDx12Upscaler=auto"]`，于是针对 `Dx12Upscaler` 的 edit 实际匹配到的是 `Foo`。失效方向是**静默漏改**：`Join` 能原样还原所以文件不会被写坏，但「配置改了却没生效」是最难排查的一类失败。代价是输出会把零星 bare LF 归一化成主导行尾——这是对「最小干预」的一次有意识让步，换取的是「不会静默漏改」。仓库根目录的真 `OptiScaler.ini` 实测 `crlf=1571 bareLf=0`，当前无此风险，但用户手改过的 INI 不保证；纯 CRLF 与纯 LF 两种文件在改动前后行为完全一致（既有 13 个测试一个都没变红）。
+**为什么 `SplitLines` 改成按 `\n` 切再剥掉行尾 `\r`**：若按检测到的主导 `newLine` 切，一个以 CRLF 为主、却夹了几行 bare LF 的文件（用户拿 Unix 编辑器手改过就会这样），那几行会被并进相邻的同一个「行」字符串里。例如 `[Upscalers]\r\nFoo=1\nDx12Upscaler=auto\r\n` 会被切成 `["[Upscalers]", "Foo=1\nDx12Upscaler=auto"]`，于是针对 `Dx12Upscaler` 的 edit 实际匹配到的是 `Foo`。失效方向是**静默漏改**：`Join` 能原样还原所以文件不会被写坏，但「配置改了却没生效」是最难排查的一类失败。代价是输出会把零星 bare LF 归一化成主导行尾——这是对「最小干预」的一次有意识让步，换取的是「不会静默漏改」。仓库根目录的真 `OptiScaler.ini` 实测 `crlf=1571 bareLf=0`，当前无此风险，但用户手改过的 INI 不保证；纯 CRLF 与纯 LF 两种文件在改动前后行为完全一致（加固改动前的既有测试全部保持绿）。
+
+**这条 `ArgumentException` 在下游怎么呈现**：它从 `IniPatcher.Patch` 抛出，穿过纯函数 planner、executor，最终由 Task 15 CLI 顶层那句 `return Fail(ex.Message, ex)` 打到 stderr——消息里带着 `Section=""`/`Key=""` 的实际值，正好是用户手改 profile JSON 时定位错误所需的线索，所以**不需要**再包一层 `DeployerException`（包了只会把这条线索换成一句更泛的话术）。计划 C 的 WPF UI 需遵守同一条：把这个异常的消息原文呈现给用户，而不是显示成「未知错误」。
+
+**`SplitLines` 会补一个尾换行**：若输入不以换行结尾，`Join` 后输出会多一个（例如 `"[A]\nK=1"` → `"[A]\nK=1\n"`）。这对 INI 无害（OptiScaler 的 SimpleIni 不关心），但计划 B 写「真 INI 回归测试」时必须明确断言口径：要么断言 `Patch(真文件)` 的输出以换行结尾，要么先确认真文件本来就以换行结尾（实测 1571 行 CRLF，是）。别把这条当成 bug 去「修」。
 
 - [x] **Step 5: 跑测试确认通过**
 
