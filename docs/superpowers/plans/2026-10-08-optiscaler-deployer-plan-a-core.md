@@ -2929,7 +2929,7 @@ git commit -m "feat(deployer): add payload sources and synthetic payload fixture
 
 Spec §6。这是「不损坏游戏」的关键闸门：官方 `setup_windows.bat` 在目标 DLL 已存在时只问一句就 `del /F`，不备份（L188-206、L379-382），游戏自带的 `version.dll` / `winmm.dll` 被永久删除——这是「装完游戏起不来」的典型成因。
 
-**对 Task 2 的一处类型修正**：`IdentityDecision` 必须多带一个 `BackupReason? ExistingFileReason`，否则 planner 无法区分「覆盖上次装的 OptiScaler」与「覆盖游戏自带文件」，只能自己重读一遍 `OriginalFilename`——那就是把判定逻辑拄成两份。修改 `src/Deployer.Core/Domain/DeploymentPlan.cs` 里的定义：
+**对 Task 2 的一处类型修正**：`IdentityDecision` 必须多带一个 `BackupReason? ExistingFileReason`，否则 planner 无法区分「覆盖上次装的 OptiScaler」与「覆盖游戏自带文件」，只能自己重读一遍 `OriginalFilename`——那就是把判定逻辑拆成两份。修改 `src/Deployer.Core/Domain/DeploymentPlan.cs` 里的定义：
 
 ```csharp
 public sealed record IdentityDecision(
@@ -4852,7 +4852,7 @@ public sealed class AtomicFileWriter
 }
 ```
 
-写 tmp 用 **不带 BOM 的 UTF8**。`OptiScaler.ini` 上游无 BOM，带 BOM 写回去会让 SimpleIni 把第一行 section 读成 `\uFEFF[Upscalers]`，直接导致整个 `[Upscalers]` 段失效。这是一个很容易踩、且症状很隐蘑的坑。
+写 tmp 用 **不带 BOM 的 UTF8**。`OptiScaler.ini` 上游无 BOM，带 BOM 写回去会让 SimpleIni 把第一行 section 读成 `\uFEFF[Upscalers]`，直接导致整个 `[Upscalers]` 段失效。这是一个很容易踩、且症状很隐蔽的坑。
 
 - [ ] **Step 4: 跑测试确认通过**
 
