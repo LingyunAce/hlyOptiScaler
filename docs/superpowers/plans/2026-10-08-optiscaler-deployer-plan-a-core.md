@@ -35,6 +35,7 @@ Spec 覆盖 4 个可独立交付的子系统，塞进一份计划会产生上千
 tools/OptiScalerDeployer/
 ├── OptiScalerDeployer.sln
 ├── Directory.Build.props                 公共编译开关
+├── Directory.Packages.props              集中包版本管理（CPM）
 ├── .gitignore                            bin/ obj/
 ├── src/
 │   ├── Deployer.Core/                    net8.0 类库，零 UI 依赖
@@ -119,6 +120,7 @@ tools/OptiScalerDeployer/
 
 **Files:**
 - Create: `tools/OptiScalerDeployer/Directory.Build.props`
+- Create: `tools/OptiScalerDeployer/Directory.Packages.props`
 - Create: `tools/OptiScalerDeployer/.gitignore`
 - Create: `tools/OptiScalerDeployer/OptiScalerDeployer.sln`（由 `dotnet new sln` 生成）
 - Create: `tools/OptiScalerDeployer/src/Deployer.Core/Deployer.Core.csproj`
