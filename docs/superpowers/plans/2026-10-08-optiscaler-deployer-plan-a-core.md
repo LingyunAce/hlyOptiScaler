@@ -99,6 +99,7 @@ tools/OptiScalerDeployer/
     │   └── FakeGameFactory.cs            FakeUeGame / FakeGdkGame / FakeConflictGame
     └── Deployer.Core.Tests/
         ├── Deployer.Core.Tests.csproj
+        ├── JsonAssert.cs                 含集合的 record 用序列化比相等（见 Task 3 Step 7）
         ├── IniPatcherTests.cs
         ├── BuiltinProfilesTests.cs
         ├── LocalBuildPayloadSourceTests.cs
@@ -714,6 +715,7 @@ git commit -m "feat(deployer): add core domain records and enums"
 - Create: `src/Deployer.Core/Abstractions/IFileVersionReader.cs`
 - Create: `src/Deployer.Core/Abstractions/WindowsFileVersionReader.cs`
 - Test: `tests/Deployer.Core.Tests/HashingTests.cs`
+- Test: `tests/Deployer.Core.Tests/JsonAssert.cs`（测试辅助，非测试）
 - Test: `tests/Deployer.Core.Tests/DeployerJsonTests.cs`
 
 - [ ] **Step 1: 写 `Errors/DeployerException.cs`**
@@ -766,11 +768,16 @@ public sealed class ChecksumMismatchException : DeployerException
 {
     public ChecksumMismatchException(string path, string expected, string actual)
         : base($"文件校验失败：{path}。可能是磁盘空间不足或杀毒软件拦截。",
-               $"expected SHA256 {expected}, actual {actual}, path {path}") { }
+               $"expected SHA256 {expected}, actual {actual}, path {path}")
+    {
+        Path = path;
+        Expected = expected;
+        Actual = actual;
+    }
 
-    public string Path { get; } = path;
-    public string Expected { get; } = expected;
-    public string Actual { get; } = actual;
+    public string Path { get; }
+    public string Expected { get; }
+    public string Actual { get; }
 }
 
 public sealed class ElevationDeclinedException : DeployerException
@@ -783,11 +790,14 @@ public sealed class ElevationDeclinedException : DeployerException
 public sealed class HealthCheckFailedException : DeployerException
 {
     public HealthCheckFailedException(string logExcerpt)
-        : base("OptiScaler 启动后报告了错误。日志摘要已保留，可一键回滚。", logExcerpt) { }
+        : base("OptiScaler 启动后报告了错误。日志摘要已保留，可一键回滚。", logExcerpt)
+        => LogExcerpt = logExcerpt;
 
-    public string LogExcerpt { get; } = logExcerpt;
+    public string LogExcerpt { get; }
 }
 ```
+
+构造函数参数**不能**用在属性初始化器里（`public string Path { get; } = path;` 会报 4 个 CS0103：参数在属性初始化器中不在作用域内）。要么用表达式构造体 `=> Path = path;`，要么用构造函数体 `{ Path = path; }`——上面两个类各用了一种，与同文件里 `GameNotWritableException` 的风格一致。
 
 - [ ] **Step 2: 写 `Serialization/DeployerJson.cs`**
 
@@ -959,9 +969,49 @@ public class HashingTests
 Run: `dotnet test OptiScalerDeployer.sln`
 Expected: **FAIL** —— `HashingTests` 编译不过（`Hashing` 尚未存在）。若 Step 3 已写完则会直接通过；此时改为确认 `通过: 13`。
 
-- [ ] **Step 7: 写 `DeployerJsonTests.cs`**
+- [ ] **Step 7: 写 `JsonAssert.cs` 与 `DeployerJsonTests.cs`**
 
-这个测试守的是「plan 能被序列化后原样读回来」——计划 D 的提权 Worker 完全依赖这一点。
+先写辅助类。它解决一个会反复出现的坑：**含 `IReadOnlyList<T>` 成员的 record 不能用 `Assert.Equal` 直接比。**
+
+`tests/Deployer.Core.Tests/JsonAssert.cs`：
+```csharp
+using Deployer.Core.Serialization;
+using Xunit;
+
+namespace Deployer.Core.Tests;
+
+/// <summary>
+/// 含 <see cref="System.Collections.Generic.IReadOnlyList{T}"/> 成员的 record 不能用
+/// <c>Assert.Equal</c> 直接比较，改比序列化结果。
+/// </summary>
+/// <remarks>
+/// 原因有两层：
+/// ① record 合成的 <c>Equals</c> 对每个字段走 <c>EqualityComparer&lt;TField&gt;.Default</c>，
+///    而 <c>IReadOnlyList&lt;T&gt;</c> 不实现 <c>IEquatable&lt;IReadOnlyList&lt;T&gt;&gt;</c>，
+///    退化为引用相等——数组与 <c>List&lt;T&gt;</c> 是两个实例，永远不等。
+/// ② xUnit 的 <c>AssertEqualityComparer&lt;T&gt;</c> 会**先**检查 <c>IEquatable&lt;T&gt;</c>（record 都实现），
+///    所以直接委派给 record 自己的 <c>Equals</c>，根本走不到 xUnit 的集合结构化比较分支。
+/// 失败时 xUnit 会把所有标量字段展成相等、只有集合的运行时类型不同，极易误判为「元素不等」。
+///
+/// 改成比序列化结果反而更贴合这些断言真正要守的性质：plan 与 manifest 本来就要
+/// 以 JSON 形态跳进程（主进程 plan → 提权 Worker）与落盘（manifest.json）。
+///
+/// 注意失效方向：将来若有人对这类 record 直接写 <c>Assert.Equal(a, b)</c>，测试会**变红**，
+/// 而不是静默通过。这是故意选的：相比手写 <c>Equals</c>/<c>GetHashCode</c> 样板（漏同步一个字段
+/// 就是静默假绿），响亮的失败安全得多。红的修法就是改用本辅助类。
+/// 不含集合成员的 record（如 <see cref="Deployer.Core.Domain.GameTarget"/>）record 相等本来就对，
+/// 继续用 <c>Assert.Equal</c> 即可。
+/// </remarks>
+public static class JsonAssert
+{
+    public static void Equivalent<T>(T expected, T actual) =>
+        Assert.Equal(DeployerJson.Serialize(expected), DeployerJson.Serialize(actual));
+}
+```
+
+再写测试。它守的是「plan 能被序列化后原样读回来」——计划 D 的提权 Worker 完全依赖这一点。
+
+`tests/Deployer.Core.Tests/DeployerJsonTests.cs`：
 
 ```csharp
 using Deployer.Core.Domain;
@@ -1019,17 +1069,19 @@ public class DeployerJsonTests
 
         var restored = DeployerJson.Deserialize<DeploymentManifest>(DeployerJson.Serialize(manifest));
 
-        Assert.Equal(manifest, restored);
+        JsonAssert.Equivalent(manifest, restored);
     }
 }
 ```
+
+注意这里用的是 `JsonAssert.Equivalent` 而不是 `Assert.Equal`：`DeploymentManifest` 含四个集合成员（`Identity.SkippedDueToConflict`、`Profile.Edits`、`Backups`、`WrittenPaths`），直接用 `Assert.Equal` 会因引用相等而失败。上一项 `GameTarget_roundtrips` 用 `Assert.Equal` 是对的，因为 `GameTarget` 全是 string 与 enum，没有集合成员。
 
 - [ ] **Step 8: 跑测试**
 
 Run: `dotnet test OptiScalerDeployer.sln`
 Expected: `失败: 0，通过: 16`
 
-若 `Manifest_roundtrips` 失败在 `Profile` 相等性上，检查 `UpscalerProfile.Edits` 是否为 `IReadOnlyList<IniEdit>` 而反序列化成了 `List<IniEdit>` —— record 的结构相等会逐元素比较，数组与 List 里的**元素**相等即可通过，容器类型不同不影响。若真失败，说明 `IniEdit` 漏了 `record` 关键字（被写成了 `class`）。
+若 `Manifest_roundtrips` 失败，先看 xUnit 的差异输出：如果所有标量字段都相等、只有集合的**运行时类型**不同（`T[]` vs `List<T>`），那不是元素不等，而是你把它写成了 `Assert.Equal`——record 对 `IReadOnlyList<T>` 字段是引用相等（详见 Step 7 的 `JsonAssert` 注释），改用 `JsonAssert.Equivalent` 即可。只有在元素**值**真的不同时，才去查 `IniEdit` / `BackupEntry` 是不是漏了 `record` 关键字（被写成了 `class`）。
 
 - [ ] **Step 9: Commit**
 
@@ -3842,7 +3894,7 @@ public class DeploymentPlannerTests
         var a = planner.Plan(Request(game));
         var b = planner.Plan(Request(game));
 
-        Assert.Equal(a, b);
+        JsonAssert.Equivalent(a, b);
     }
 
     [Fact]
@@ -3854,7 +3906,7 @@ public class DeploymentPlannerTests
         var restored = Deployer.Core.Serialization.DeployerJson.Deserialize<DeploymentPlan>(
             Deployer.Core.Serialization.DeployerJson.Serialize(plan));
 
-        Assert.Equal(plan, restored);
+        JsonAssert.Equivalent(plan, restored);
     }
 
     [Fact]
@@ -4535,7 +4587,7 @@ public class BackupStoreTests
 
         store.WriteManifest(manifest);
 
-        Assert.Equal(manifest, store.ReadManifest(store.ManifestPathFor(Fingerprint, planId)));
+        JsonAssert.Equivalent(manifest, store.ReadManifest(store.ManifestPathFor(Fingerprint, planId)));
     }
 
     [Fact]
@@ -4568,7 +4620,7 @@ public class BackupStoreTests
 
         store.WriteProgress(progress);
 
-        Assert.Equal(progress, store.ReadProgress(store.ProgressPathFor(Fingerprint, planId)));
+        JsonAssert.Equivalent(progress, store.ReadProgress(store.ProgressPathFor(Fingerprint, planId)));
     }
 
     [Fact]
@@ -6802,6 +6854,8 @@ git commit -m "docs(deployer): sync spec with Plan A type refinements"
 | `IdentityDecision` / `FileWrite` / `DeploymentManifest` 少一个字段 | planner 无法区分覆盖原因、executor 拿不到 patch 后的 INI、回滚删不掉自建空目录 | 三处已细化（Task 7/9/10 的 Step 0），Task 16 回写 spec |
 | planner 调用两个不存在的成员 | 直接编译不过 | 改为 `.AppendedEdits` 与 `BuildWarnings(..., backups)` |
 | CLI 里多一个 `ProfileStore` 包装类 | `JsonProfileStore` 已实现 `IProfileStore`，包装纯属噪音 | 已删，`Plan` 直接构造 `JsonProfileStore` |
+| `ChecksumMismatchException` / `HealthCheckFailedException` 把构造函数参数用在属性初始化器里 | 4 个 CS0103 硬编译错误，Task 3 直接建不起来 | 已改为构造函数体 / 表达式构造体（Task 3 Step 1） |
+| 5 处断言用 `Assert.Equal` 直接比含 `IReadOnlyList<T>` 成员的 record | record 对这类字段是**引用相等**（xUnit 又会优先走 `IEquatable<T>` 而绕开自己的集合比较），测试必然变红，且失败信息极具误导性 | 新增 `JsonAssert.Equivalent` 并改完 5 处（Task 3 Step 7、Task 9 两处、Task 10 两处） |
 
 执行过程中唯一需要临时调整的既知项：Task 12 Step 2 的 `Executor()` 辅助方法依赖 Task 11 的 `RollbackExecutor`。若你打乱任务顺序、先做 Task 12，那一个「失败中途回滚」的测试需临时 `Skip`；按 Task 编号顺序执行则无此问题。
 
