@@ -32,6 +32,7 @@ public class WindowsFileVersionReaderTests
             File.WriteAllText(notAPe, "这不是 PE 文件，只是一段普通文本。");
 
             Assert.Null(reader.GetOriginalFilename(notAPe));
+            Assert.Null(reader.GetFileVersion(notAPe));
         }
         finally
         {

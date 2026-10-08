@@ -61,8 +61,10 @@ public class DeployerJsonTests
     {
         var json = DeployerJson.Serialize(new PlanWarning(WarningSeverity.Caution, "身份 DLL 全部冲突"));
 
+        // 原文出现，就已经独立且精确地证明了中文没被转义成 \uXXXX。
+        // 别再补「不含某转义前缀」那类断言：含 Windows 路径的载荷会把反斜杠转义成
+        // 两个字符，紧跟 u 的路径段会伪造出同样子串 → 假失败。
         Assert.Contains("身份 DLL 全部冲突", json);
-        Assert.DoesNotContain("\\u", json);
     }
 
     // 这些名字是 manifest.json 与 ledger.json 的**落盘契约**：改个成员名或改拼写，
