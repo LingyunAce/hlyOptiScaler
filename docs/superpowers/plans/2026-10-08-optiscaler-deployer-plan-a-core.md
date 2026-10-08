@@ -128,7 +128,7 @@ tools/OptiScalerDeployer/
 - Create: `tools/OptiScalerDeployer/tests/Deployer.Core.Tests/Deployer.Core.Tests.csproj`
 - Create: `tools/OptiScalerDeployer/tests/Deployer.TestData/Deployer.TestData.csproj`
 
-- [ ] **Step 1: 安装 .NET 8 SDK**
+- [x] **Step 1: 安装 .NET 8 SDK**
 
 本机现状已核实：`C:\Program Files\dotnet` 只有 host 与 shared，`dotnet --list-sdks` 返回 `No .NET SDKs were found`。必须先装 SDK。
 
@@ -149,7 +149,7 @@ Invoke-WebRequest https://dot.net/v1/dotnet-install.ps1 -OutFile "$env:TEMP\dotn
 ```
 此时 SDK 落在 `$env:LOCALAPPDATA\Microsoft\dotnet`，后续所有 `dotnet` 命令改用该绝对路径。
 
-- [ ] **Step 2: 建目录树**
+- [x] **Step 2: 建目录树**
 
 Run:
 ```powershell
@@ -158,7 +158,7 @@ New-Item -ItemType Directory -Force -Path "tools\OptiScalerDeployer\src","tools\
 ```
 Expected: 无输出，`Test-Path "tools\OptiScalerDeployer\src"` 为 `True`
 
-- [ ] **Step 3: 写 `Directory.Build.props`**
+- [x] **Step 3: 写 `Directory.Build.props`**
 
 `tools/OptiScalerDeployer/Directory.Build.props`：
 ```xml
@@ -176,7 +176,7 @@ Expected: 无输出，`Test-Path "tools\OptiScalerDeployer\src"` 为 `True`
 
 `AnalysisLevel` 钉死在 `8.0`：它默认解析为 `latest`，意味着分析器规则集会随本机装了哪个 SDK 而漂移，叠上 `TreatWarningsAsErrors=true` 就会制造「代码一行没动、构建突然红」的故障；钉版本让规则集可复现。**不要**再加 `AnalysisMode`（`Recommended` 会打开一批额外规则，在本工程里等于一批新的硬错误），保持隐式默认。`CA1416`（Windows 平台兼容性）**不做任何压制**：本产品确实是 Windows 专用工具、`Core` 却定 `net8.0`（而非 `net8.0-windows`）以便测试宿主轻量，但原计划据此认为 `WindowsFileVersionReader`（Task 3）用到的 `System.Diagnostics.FileVersionInfo` 会触发 CA1416，已在 SDK 8.0.425 上实测证伪——.NET 8 的 `FileVersionInfo` 并未标注 `[SupportedOSPlatform("windows")]`，因此不产生 CA1416，无需任何 suppression 即可干净编译；而一条没有事实依据的全局 `NoWarn` 一旦写下，后面的代码会长在它上面，就再也摘不掉了。若将来真的引入 Windows 专有 API（Plan D 的注册表 / `WindowsApps` 访问），正确机制是在**那个**程序集上加 `[assembly: SupportedOSPlatform("windows")]`，而不是全局 `NoWarn`；同样**不要**用 `#pragma warning disable` 逐处压制——那是把全局决策散落成局部噪音。
 
-- [ ] **Step 4: 写 `.gitignore`**
+- [x] **Step 4: 写 `.gitignore`**
 
 `tools/OptiScalerDeployer/.gitignore`：
 ```
@@ -186,7 +186,7 @@ obj/
 TestResults/
 ```
 
-- [ ] **Step 5: 建四个项目**
+- [x] **Step 5: 建四个项目**
 
 Run:
 ```powershell
@@ -201,7 +201,7 @@ Expected: 四次 `The template ... was created successfully.`
 
 `dotnet new` 生成的 csproj 已含 `TargetFramework`，但**不含** Step 3 里那些公共开关之外的东西——需要手工覆盖成下面的内容。
 
-- [ ] **Step 6: 写 `Directory.Packages.props`，并覆盖四个 csproj**
+- [x] **Step 6: 写 `Directory.Packages.props`，并覆盖四个 csproj**
 
 **6a. `tools/OptiScalerDeployer/Directory.Packages.props`（集中包版本管理，CPM）：**
 ```xml
@@ -300,7 +300,7 @@ Expected: 四次 `The template ... was created successfully.`
 
 包版本已核实为 .NET 8 兼容的当前稳定版。若 `dotnet restore` 报某个版本不存在，用 `dotnet package search System.IO.Abstractions --take 1` 查实际最新版，然后**只改 `Directory.Packages.props` 这一个地方**——CPM 之下四个 csproj 根本不含版本号，既不需要、也不允许再去「四处同步替换」（真在 csproj 里写 `Version` 会直接报 NU1008）。注意 `System.IO.Abstractions` 与 `System.IO.Abstractions.TestingHelpers` 必须一起改成同一个版本，理由见 6a。
 
-- [ ] **Step 7: 建 sln 并挂载**
+- [x] **Step 7: 建 sln 并挂载**
 
 Run:
 ```powershell
@@ -315,7 +315,7 @@ Expected: 四次 `已将项目"..."添加到解决方案中。`（或英文 `add
 
 **不要**把这个 sln 加进 `OptiScaler.sln`，也不要动 `.github/workflows/build.yml`。nightly CI 直接依赖 `msbuild OptiScaler.sln` 与 `x64\Release\a\*.*`，混入 C# 项目会干扰那条流水线（spec §3.1）。
 
-- [ ] **Step 8: 验证构建与测试空跑**
+- [x] **Step 8: 验证构建与测试空跑**
 
 Run:
 ```powershell
@@ -325,14 +325,14 @@ dotnet test OptiScalerDeployer.sln --no-build
 ```
 Expected: build `0 个警告 / 0 个错误`（`0 Warning(s) 0 Error(s)`）；test 通过 1 个由 `dotnet new xunit` 生成的 `UnitTest1.Test1`。
 
-- [ ] **Step 9: 删掉模板测试**
+- [x] **Step 9: 删掉模板测试**
 
 删除 `tests/Deployer.Core.Tests/UnitTest1.cs`。
 
 Run: `dotnet test OptiScalerDeployer.sln`
 Expected: **退出码 0**（PowerShell 里 `$LASTEXITCODE` 为 0）——这是唯一的通过判据。测试程序集此刻零个测试，VSTest 17.11.1 只会打印一行 `...\Deployer.Core.Tests.dll 中没有可用测试。请确保已注册测试发现器和执行器且平台和框架版本设置合理，然后重试。`，并且**不会**打印 `已通过! - 失败: 0，通过: 0` 那样的汇总行。看不到「已通过」不等于失败，别去「修」它。
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add tools/OptiScalerDeployer
@@ -359,7 +359,7 @@ git commit -m "chore(deployer): scaffold OptiScalerDeployer solution (Plan A tas
 - Create: `src/Deployer.Core/Domain/InstallRecord.cs`
 - Test: `tests/Deployer.Core.Tests/DllIdentityMapTests.cs`（唯一有行为的一个）
 
-- [ ] **Step 1: 写 `Domain/Enums.cs`**
+- [x] **Step 1: 写 `Domain/Enums.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
@@ -393,7 +393,7 @@ public enum UpscalerSdk { Dlss, Streamline, XeSS, Fsr2, Fsr3, FfxApi }
 public enum InstallState { Installed, Healthy, RolledBack, NeedsReinstall, Failed }
 ```
 
-- [ ] **Step 2: 写 `Domain/DllIdentityMap.cs`**
+- [x] **Step 2: 写 `Domain/DllIdentityMap.cs`**
 
 身份↔文件名的映射必须只有一份真相，否则 planner 与 rollback 会对不上号。
 
@@ -418,7 +418,7 @@ public static class DllIdentityMap
 }
 ```
 
-- [ ] **Step 3: 写 `Domain/GameTarget.cs`**
+- [x] **Step 3: 写 `Domain/GameTarget.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
@@ -438,7 +438,7 @@ public sealed record GameTarget(
     string Fingerprint);
 ```
 
-- [ ] **Step 4: 写 `Domain/InspectionSummary.cs`**
+- [x] **Step 4: 写 `Domain/InspectionSummary.cs`**
 
 本计划只定义形状并由 CLI 手工填充；真正的检测器在计划 B。
 
@@ -472,7 +472,7 @@ public sealed record InspectionSummary
 }
 ```
 
-- [ ] **Step 5: 写 `Domain/UpscalerProfile.cs`**
+- [x] **Step 5: 写 `Domain/UpscalerProfile.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
@@ -491,7 +491,7 @@ public sealed record UpscalerProfile
 }
 ```
 
-- [ ] **Step 6: 写 `Domain/PayloadBundle.cs`**
+- [x] **Step 6: 写 `Domain/PayloadBundle.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
@@ -507,7 +507,7 @@ public sealed record PayloadInfo(PayloadOrigin Origin, string Version, string Ro
 }
 ```
 
-- [ ] **Step 7: 写 `Domain/IniEdit.cs`**
+- [x] **Step 7: 写 `Domain/IniEdit.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
@@ -529,7 +529,7 @@ public sealed record BackupEntry(string OriginalPath, string BackupPath, BackupR
 public sealed record PlanWarning(WarningSeverity Severity, string Message);
 ```
 
-- [ ] **Step 8: 写 `Domain/DeploymentPlan.cs`**
+- [x] **Step 8: 写 `Domain/DeploymentPlan.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
@@ -563,7 +563,7 @@ public sealed record IdentityDecision(
     string? UserPromptMessage);
 ```
 
-- [ ] **Step 9: 写 `Domain/DeploymentManifest.cs`**
+- [x] **Step 9: 写 `Domain/DeploymentManifest.cs`**
 
 回滚的唯一依据。写进影子备份目录。
 
@@ -574,6 +574,15 @@ namespace Deployer.Core.Domain;
 /// 影子备份目录内的 manifest.json。RollbackExecutor 只认这个文件，
 /// 绝不扫描目录猜测该删什么。
 /// </summary>
+/// <remarks>
+/// 本类型跨版本长寿命持久化：安装时写盘，可能数月后被更高版本的工具读回，
+/// 而「任何时候都能回滚」正是本工具的核心承诺。System.Text.Json 在反序列化
+/// 缺失 <c>required</c> 成员的 JSON 时会抛异常——一旦某次升级给本类型加了
+/// <c>required</c> 字段，磁盘上旧版本写下的 manifest 就会读不回来，用户将
+/// 无法回滚当初装过的游戏。因此 v1 发布之后，对本类型的任何新增字段
+/// **必须是可空类型或带默认值**，禁止使用 <c>required</c>；
+/// 若确实需要破坏性变更，先引入 SchemaVersion 并写兼容分支。
+/// </remarks>
 public sealed record DeploymentManifest
 {
     public required Guid PlanId { get; init; }
@@ -591,7 +600,7 @@ public sealed record DeploymentManifest
 }
 ```
 
-- [ ] **Step 10: 写 `Domain/DeploymentProgress.cs`**
+- [x] **Step 10: 写 `Domain/DeploymentProgress.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
@@ -617,12 +626,17 @@ public sealed record RollbackResult(
     string? ErrorMessage);
 ```
 
-- [ ] **Step 11: 写 `Domain/InstallRecord.cs`**
+- [x] **Step 11: 写 `Domain/InstallRecord.cs`**
 
 ```csharp
 namespace Deployer.Core.Domain;
 
 /// <summary>台账条目。ledger.json 只存这个索引，明细在各 PlanId 的 manifest.json 里。</summary>
+/// <remarks>
+/// 与 <see cref="DeploymentManifest"/> 同属跨版本长寿命持久化类型，适用同一条约定：
+/// v1 发布之后新增字段必须可空或带默认值，禁止 <c>required</c>，
+/// 否则旧 ledger.json 在新版工具下会反序列化失败。
+/// </remarks>
 public sealed record InstallRecord
 {
     public required string Fingerprint { get; init; }
@@ -637,7 +651,7 @@ public sealed record InstallRecord
 }
 ```
 
-- [ ] **Step 12: 写 `DllIdentityMap` 的测试**
+- [x] **Step 12: 写 `DllIdentityMap` 的测试**
 
 `tests/Deployer.Core.Tests/DllIdentityMapTests.cs`：
 ```csharp
@@ -673,7 +687,7 @@ public class DllIdentityMapTests
 }
 ```
 
-- [ ] **Step 13: 跑测试**
+- [x] **Step 13: 跑测试**
 
 Run:
 ```powershell
@@ -682,7 +696,7 @@ dotnet test OptiScalerDeployer.sln
 ```
 Expected: `失败: 0，通过: 9`
 
-- [ ] **Step 14: Commit**
+- [x] **Step 14: Commit**
 
 ```bash
 git add tools/OptiScalerDeployer
@@ -6717,7 +6731,13 @@ public sealed record FileWrite(
 
 > **重复部署同一游戏的回滚顺序**：第二次部署时，影子备份里存的是第一次部署的产物（即 OptiScaler 自己的 DLL），不是游戏原件。因此只回滚最新一份会把游戏留在「装着 OptiScaler 但台账说已卸载」的状态。卸载必须**逆序回放该指纹下全部未回滚的份数**。
 
-- [ ] **Step 7: 全量验证**
+- [ ] **Step 7: 给 §5.1 补上跨版本持久化类型的前向兼容约定**
+
+在 §5.1 的 `DeploymentManifest` / `InstallRecord` 定义附近补一段：
+
+> `DeploymentManifest`（`manifest.json`）与 `InstallRecord`（`ledger.json`）是**跨版本长寿命持久化**类型：安装时写盘，可能数月后被更高版本的工具读回。`System.Text.Json` 在反序列化缺失 `required` 成员的 JSON 时会抛异常，因此 v1 发布之后，对这两个类型的任何新增字段**必须是可空类型或带默认值，禁止使用 `required`**——否则旧版本写下的 manifest/ledger 在新版工具下会读不回来，用户将无法回滚当初装过的游戏，而「任何时候都能回滚」正是本工具的核心承诺。若确需破坏性变更，先引入 `SchemaVersion` 并写兼容分支。（`DeploymentPlan` 只在同一二进制版本内跨进程传递，不受此约束。）
+
+- [ ] **Step 8: 全量验证**
 
 Run:
 ```powershell
@@ -6727,7 +6747,7 @@ dotnet test OptiScalerDeployer.sln -c Release
 ```
 Expected: build `0 警告 0 错误`；test `失败: 0`
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add docs tools
