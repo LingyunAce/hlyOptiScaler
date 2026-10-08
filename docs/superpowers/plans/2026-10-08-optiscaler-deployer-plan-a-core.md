@@ -2292,7 +2292,7 @@ Spec §8.1。已确认的决策 #8：DX11/Vulkan 走 `ffx_12`（DX12 interop，�
 - Test: `tests/Deployer.Core.Tests/BuiltinProfilesTests.cs`
 - Test: `tests/Deployer.Core.Tests/JsonProfileStoreTests.cs`
 
-- [ ] **Step 1: 写 `BuiltinProfiles` 的失败测试**
+- [x] **Step 1: 写 `BuiltinProfiles` 的失败测试**
 
 `tests/Deployer.Core.Tests/BuiltinProfilesTests.cs`：
 ```csharp
@@ -2403,12 +2403,12 @@ public class BuiltinProfilesTests
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter BuiltinProfilesTests`
 Expected: 编译错误 `BuiltinProfiles 不存在`
 
-- [ ] **Step 3: 写 `Profiles/BuiltinProfiles.cs`**
+- [x] **Step 3: 写 `Profiles/BuiltinProfiles.cs`**
 
 ```csharp
 using Deployer.Core.Domain;
@@ -2537,12 +2537,12 @@ cd "d:\AI\project\hlyOptiScaler"
 $e=New-Object System.Text.UTF8Encoding($false); $L=[System.IO.File]::ReadAllText((Resolve-Path 'OptiScaler.ini'),$e) -split "`r`n"; 315..319 | ForEach-Object { "L$_`: " + $L[$_-1] }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `dotnet test OptiScalerDeployer.sln --filter BuiltinProfilesTests`
 Expected: `失败: 0，通过: 9`
 
-- [ ] **Step 5: 写 `Profiles/IProfileStore.cs`**
+- [x] **Step 5: 写 `Profiles/IProfileStore.cs`**
 
 ```csharp
 using Deployer.Core.Domain;
@@ -2565,7 +2565,7 @@ public interface IProfileStore
 }
 ```
 
-- [ ] **Step 6: 写 `JsonProfileStore` 的失败测试**
+- [x] **Step 6: 写 `JsonProfileStore` 的失败测试**
 
 `tests/Deployer.Core.Tests/JsonProfileStoreTests.cs`：
 ```csharp
@@ -2650,7 +2650,7 @@ public class JsonProfileStoreTests
 
 「损坏的 profiles.json 不能让程序起不来」是硬要求：这个文件在 `%APPDATA%`，用户可能手改过，也可能被同步工具截断。
 
-- [ ] **Step 7: 写 `Profiles/JsonProfileStore.cs`**
+- [x] **Step 7: 写 `Profiles/JsonProfileStore.cs`**
 
 ```csharp
 using System.IO.Abstractions;
@@ -2742,14 +2742,14 @@ public sealed class JsonProfileStore : IProfileStore
 }
 ```
 
-- [ ] **Step 8: 跑测试**
+- [x] **Step 8: 跑测试**
 
 Run: `dotnet test OptiScalerDeployer.sln`
 Expected: `失败: 0，通过: 73`
 
 （73 = Task 4 结束时的实测基线 **59** + `BuiltinProfilesTests` **9** + `JsonProfileStoreTests` **5**。上面 Task 3 那个 Step 写的「通过: 33」同样是偏小的推算值，实测是 59——这类累加值只供对照，闸门始终是 `失败: 0`，见本计划末尾的说明。）
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add tools/OptiScalerDeployer
