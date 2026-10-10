@@ -26,4 +26,5 @@ public sealed record IdentityDecision(
     string FileName,
     IdentityStatus Status,
     IReadOnlyList<DllIdentity> SkippedDueToConflict,
+    BackupReason? ExistingFileReason,
     string? UserPromptMessage);

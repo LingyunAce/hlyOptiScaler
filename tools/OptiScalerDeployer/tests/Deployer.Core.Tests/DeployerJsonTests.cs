@@ -1,5 +1,6 @@
 using Deployer.Core.Domain;
 using Deployer.Core.Serialization;
+using System.Text.Json.Nodes;
 using Xunit;
 
 namespace Deployer.Core.Tests;
@@ -40,7 +41,7 @@ public class DeployerJsonTests
             Payload = new PayloadInfo(PayloadOrigin.LocalBuild, "0.9.1.0", @"D:\repo\x64\Release\a"),
             Identity = new IdentityDecision(
                 DllIdentity.Winmm, "winmm.dll", IdentityStatus.Resolved,
-                new[] { DllIdentity.Dxgi }, null),
+                new[] { DllIdentity.Dxgi }, BackupReason.OverwriteGameFile, null),
             Profile = new UpscalerProfile
             {
                 Id = "amd-rdna4", DisplayName = "AMD RDNA4", Description = "RX 9070 XT",
@@ -49,11 +50,58 @@ public class DeployerJsonTests
             },
             Backups = new[] { new BackupEntry(@"C:\game\winmm.dll", @"C:\backup\winmm.dll", BackupReason.OverwriteGameFile) },
             WrittenPaths = new[] { @"C:\game\winmm.dll", @"C:\game\OptiScaler.ini" },
+            CreatedDirectories = new[] { @"C:\game\OptiScaler", @"C:\game\Licenses" },
         };
 
         var restored = DeployerJson.Deserialize<DeploymentManifest>(DeployerJson.Serialize(manifest));
 
         JsonAssert.Equivalent(manifest, restored);
+    }
+
+    [Fact]
+    public void Older_manifest_without_created_directories_remains_readable()
+    {
+        var manifest = new DeploymentManifest
+        {
+            PlanId = Guid.Parse("11111111-2222-3333-4444-555555555555"),
+            CreatedUtc = new DateTime(2026, 10, 8, 12, 0, 0, DateTimeKind.Utc),
+            Fingerprint = "a1b2c3d4",
+            GameTitle = "Halo Infinite",
+            DeployDirectory = @"C:\XboxGames\Halo Infinite\content",
+            Payload = new PayloadInfo(PayloadOrigin.LocalBuild, "0.9.1.0", @"D:\repo\x64\Release\a"),
+            Identity = new IdentityDecision(
+                DllIdentity.Winmm, "winmm.dll", IdentityStatus.Resolved,
+                Array.Empty<DllIdentity>(), BackupReason.OverwriteGameFile, null),
+            Profile = new UpscalerProfile
+            {
+                Id = "amd-rdna4", DisplayName = "AMD RDNA4", Description = "RX 9070 XT",
+                IsBuiltin = true,
+                Edits = new[] { new IniEdit("Upscalers", "Dx12Upscaler", null, "ffx") },
+            },
+            Backups = Array.Empty<BackupEntry>(),
+            WrittenPaths = Array.Empty<string>(),
+        };
+
+        var oldJson = JsonNode.Parse(DeployerJson.Serialize(manifest))!.AsObject();
+        oldJson.Remove("createdDirectories");
+        oldJson["identity"]!.AsObject().Remove("existingFileReason");
+        var restored = DeployerJson.Deserialize<DeploymentManifest>(oldJson.ToJsonString(DeployerJson.Options));
+
+        Assert.Empty(restored.CreatedDirectories);
+        Assert.Null(restored.Identity.ExistingFileReason);
+    }
+
+    [Fact]
+    public void FileWrite_roundtrips_inline_content_and_its_integrity_metadata()
+    {
+        var write = new FileWrite(
+            @"D:\payload\OptiScaler.ini", @"C:\game\OptiScaler.ini", 6,
+            "0123456789abcdef", "配置");
+
+        var restored = DeployerJson.Deserialize<FileWrite>(DeployerJson.Serialize(write));
+
+        Assert.Equal(write, restored);
+        Assert.Equal("配置", restored.InlineContent);
     }
 
     [Fact]

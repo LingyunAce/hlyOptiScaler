@@ -27,4 +27,7 @@ public sealed record DeploymentManifest
 
     /// <summary>本次新增/覆盖的全部目标路径。无对应 BackupEntry 的即为「纯新增」，回滚时直接删。</summary>
     public required IReadOnlyList<string> WrittenPaths { get; init; }
+
+    /// <summary>部署期间新建的目录，回滚时仅在目录为空时删除；缺失表示旧版清单未记录目录。</summary>
+    public IReadOnlyList<string> CreatedDirectories { get; init; } = Array.Empty<string>();
 }

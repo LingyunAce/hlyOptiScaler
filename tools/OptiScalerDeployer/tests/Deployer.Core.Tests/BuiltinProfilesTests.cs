@@ -102,4 +102,15 @@ public class BuiltinProfilesTests
     {
         Assert.All(BuiltinProfiles.All, p => Assert.True(p.IsBuiltin));
     }
+
+    [Fact]
+    public void All_ships_exactly_the_three_profiles_in_order()
+    {
+        // 钉死 Id 与顺序：UI 的下拉框、以及「9070 XT 默认选哪个」都依赖它。
+        // 期望值必须是字面量——写成 BuiltinProfiles.All.Select(...) 就等于没测：
+        // 复核时从 All 里摘掉 NvidiaRtx，全套 73 个测试依然全绿。
+        Assert.Equal(
+            new[] { "amd-rdna4", "amd-rdna4-native", "nvidia-rtx" },
+            BuiltinProfiles.All.Select(p => p.Id).ToArray());
+    }
 }

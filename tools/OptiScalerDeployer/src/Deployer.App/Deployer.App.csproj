@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Deployer.App</RootNamespace>
+    <AssemblyName>opti-deploy-app</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.IO.Abstractions" />
+    <ProjectReference Include="..\Deployer.Core\Deployer.Core.csproj" />
+    <ProjectReference Include="..\Deployer.Worker\Deployer.Worker.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+  <Target Name="CopyElevationWorker" AfterTargets="Build">
+    <PropertyGroup>
+      <WorkerOutputRoot>$(MSBuildProjectDirectory)\..\Deployer.Worker\bin\$(Configuration)\$(TargetFramework)\</WorkerOutputRoot>
+      <WorkerOutputRoot Condition="'$(RuntimeIdentifier)' != ''">$(MSBuildProjectDirectory)\..\Deployer.Worker\bin\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)\</WorkerOutputRoot>
+    </PropertyGroup>
+    <ItemGroup><WorkerFiles Include="$(WorkerOutputRoot)*" Exclude="$(WorkerOutputRoot)*.pdb" /></ItemGroup>
+    <Copy SourceFiles="@(WorkerFiles)" DestinationFolder="$(TargetDir)worker\" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="PublishElevationWorker" AfterTargets="Publish">
+    <PropertyGroup>
+      <WorkerPublishDir>$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)\worker-publish\</WorkerPublishDir>
+    </PropertyGroup>
+    <RemoveDir Directories="$(WorkerPublishDir)" />
+    <MSBuild Projects="$(MSBuildProjectDirectory)\..\Deployer.Worker\Deployer.Worker.csproj" Targets="Publish"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=$(RuntimeIdentifier);SelfContained=$(SelfContained);PublishSingleFile=false;PublishTrimmed=false;PublishDir=$(WorkerPublishDir);NoBuild=false"
+             BuildInParallel="false" />
+    <ItemGroup><PublishedWorkerFiles Include="$(WorkerPublishDir)**\*" Exclude="$(WorkerPublishDir)**\*.pdb" /></ItemGroup>
+    <Copy SourceFiles="@(PublishedWorkerFiles)" DestinationFiles="@(PublishedWorkerFiles->'$(PublishDir)worker\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+  </Target>
+</Project>
+

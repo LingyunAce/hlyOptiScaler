@@ -1,7 +1,7 @@
 # OptiScaler Deployer 设计文档
 
 **日期**：2026-10-08
-**状态**：已确认，待生成实施计划
+**状态**：Plan A–D 主要路径已实现；355 项自动化测试和 22 项隔离功能检查通过。真实 UAC、游戏启动、GPU/驱动仍待验收；来源/channel 桌面选择尚未实现，实时 Releases API 当前限额。详见 [功能验收](../plans/2026-10-10-optiscaler-deployer-functionality-validation.md)
 **目标硬件**：AMD Radeon RX 9070 XT（RDNA4）
 **目标平台**：Windows 10/11，主要面向 Xbox PC（PC Game Pass / Microsoft Store）游戏
 
@@ -18,7 +18,9 @@ OptiScaler 是一个游戏超分/帧生成中间件，以 DLL 侧载方式运行
 3. 自己判断该开哪些 Input、该不该开 GPU 伪装
 4. 手工编辑 51 KB 的 `OptiScaler.ini`
 
-本工具（下称 **Deployer**）把上述四步自动化：**扫描游戏 → 体检 → 生成计划 → 用户确认 → 安全部署 → 健康检查 → 失败自动回滚**。
+本工具（下称 **Deployer**）把上述四步自动化：**扫描游戏 → 体检 → 生成计划 → 用户确认 → 安全部署 → 主动健康检查 → 按清单恢复**。
+
+这份文档描述完整目标产品。Plan A Core 引擎和 CLI、Plan B 游戏扫描与静态体检、Plan C WPF 桌面 UI，以及 Plan D 的受限提权 Worker、GitHub Releases payload 和健康检查主要路径已实现。隔离验收完成官方资产下载校验、真实文件部署和恢复；实时 metadata 查询因 API 限额不可用。未启动真实游戏、未请求 UAC、未验证 GPU/驱动；来源/channel 桌面选择和真实游戏兼容仍属于剩余工作。
 
 ### 1.2 关键前提：DLSS 4 在 Windows + AMD 上不可行
 
@@ -108,6 +110,7 @@ tools/OptiScalerDeployer/           ← 新增，与 OptiScaler/ 平级
 │   └── Deployer.Worker/             net8.0-windows 控制台，提权路径唯一入口
 └── tests/
     ├── Deployer.Core.Tests/         xUnit
+    ├── Deployer.App.Tests/          xUnit，headless 服务与 ViewModel 测试
     └── Deployer.TestData/           假游戏目录 fixture
 ```
 
@@ -162,7 +165,7 @@ v1 实现四个：
 - **`XboxScanner`**（重点）
   - 枚举所有固定驱动器的 `<drive>\XboxGames\*\content\`
   - 枚举 `<drive>\WindowsApps\*` 中的 reparse point（junction）并解析 target，覆盖老式安装
-  - 用 WinRT `Windows.Management.Deployment.PackageManager.FindPackages()` 取 `DisplayName` / `InstalledLocation` / `Id.FamilyName`，与目录扫描结果匹配合并去重（普通权限下只能拿到当前用户的包，对本场景足够）
+  - 用 WinRT `Windows.Management.Deployment.PackageManager.FindPackagesForUser(string.Empty)` 读取当前用户的 `DisplayName` / `InstalledLocation` / `Id.FamilyName`，与目录扫描结果匹配合并去重；不枚举其他用户，也不要求管理员权限。参考[微软 API 文档](https://learn.microsoft.com/en-us/uwp/api/windows.management.deployment.packagemanager.findpackagesforuser)
   - exe 识别优先级：`*-WinGDK-Shipping.exe` → `*-Win64-Shipping.exe` → 目录中体积最大且非启动器/非崩溃处理器的 exe
   - 对每个候选目录做实际可写性探测（尝试创建并删除临时文件），产出 `DirectoryWritability`
 - **`SteamScanner`**：`HKCU\Software\Valve\Steam` → `SteamPath` → 解析 `libraryfolders.vdf` → 各 library 的 `steamapps\appmanifest_*.acf` → name + installdir + appid
@@ -201,11 +204,11 @@ v1 实现四个：
               → 解析：OptiScaler 版本行、选中的 Output upscaler、Error/Fatal 行
 ⑦ Commit / Rollback
               健康 → InstallLedger 落库，标记 Installed + Healthy
-              失败 → RollbackExecutor 按 manifest 逆序还原 → 台账标记 RolledBack
+              失败或超时 → 保留部署，用户选择继续等待 / 查看日志 / 按清单恢复
                      并把日志摘要留在 UI 上供排查
 ```
 
-回滚的两个触发点：⑥ 健康检查失败自动触发；UI 上「卸载」按钮手动触发。两者走同一条 `RollbackExecutor` 路径。
+写入失败或取消时 executor 尝试自动恢复；健康检查失败或超时保留部署，用户明确选择按清单恢复。桌面手动回滚以普通权限运行，需要提权的恢复通过管理员 CLI 执行。
 
 ---
 
@@ -234,13 +237,18 @@ public sealed record GameTarget(
 
 public sealed record IdentityDecision(
     DllIdentity Chosen, string FileName, IdentityStatus Status,
-    IReadOnlyList<DllIdentity> SkippedDueToConflict, string? UserPromptMessage);
+    IReadOnlyList<DllIdentity> SkippedDueToConflict,
+    BackupReason? ExistingFileReason, string? UserPromptMessage);
 
 public enum IdentityStatus { Resolved, RequiresUserDecision, NoCandidateAvailable }
 public enum DllIdentity { Dxgi, Winmm, Version, Dbghelp, D3d12, Wininet, Winhttp, Asi }
 
-public sealed record FileWrite(string SourcePath, string DestinationPath, long Length, string Sha256);
-public sealed record BackupEntry(string OriginalPath, string BackupPath, BackupReason Reason);
+public sealed record FileWrite(
+    string SourcePath, string DestinationPath, long Length, string Sha256,
+    string? InlineContent = null);
+// IsInline is derived from InlineContent != null; it is not persisted separately.
+public sealed record BackupEntry(
+    string OriginalPath, string BackupPath, BackupReason Reason, string? Sha256 = null);
 public sealed record IniEdit(string Section, string Key, string? OldValue, string NewValue);
 public enum BackupReason { OverwriteGameFile, OverwritePreviousOpti, IniModified }
 public enum ElevationRequirement { NotRequired, Required, Declined, Blocked }
@@ -252,11 +260,15 @@ public sealed record PlanWarning(WarningSeverity Severity, string Message);
 public enum WarningSeverity { Info, Caution, Blocking }
 ```
 
+`IdentityDecision.ExistingFileReason` 为 null 表示目标位置原本为空；有值时记录覆盖原因，使 planner 无需重读文件版本信息也能区分覆盖旧版 OptiScaler 与覆盖游戏文件。`FileWrite.InlineContent` 非 null 时 executor 写入该内容（例如已 patch 的 INI），不再运行 IniPatcher。`BackupEntry.Sha256` 在备份时填入，planner 阶段保持 null。
+
+`DeploymentManifest.CreatedDirectories` 是可选字段，默认 `Array.Empty<string>()`，因此不含该字段的旧 manifest 仍可读取。`DeploymentManifest` 与 `InstallRecord` 是跨版本持久化类型；版本发布后新增字段必须可空或带默认值，不能新增 `required` 成员。若需破坏性变更，应先增加 SchemaVersion 并提供兼容分支。`DeploymentPlan` 只在当前程序版本间传递，不受此限制。
+
 `Fingerprint` = `SHA256("<平台>|<PackageFamilyName 或 InstallRoot 绝对路径>|<exe 名>")` 取前 8 位十六进制小写。输入统一小写并做路径规范化（`Path.GetFullPath`），保证同一游戏在不同扫描轮次得到稳定值。
 
 `Writes` 与 `Backups` 是**两个独立列表**，不是一一对应 —— OptiScaler 部署的本质是「新增一批文件」，只有极少数可能与游戏自带文件重名。硬绑成一对会让数据结构说谎。
 
-`Warnings` 中 `Blocking` 级别的存在会让 UI 禁用「执行」按钮（v1 唯一的触发条件：体检发现游戏没有任何超分 SDK，装了也不会生效）；`Caution` 仅要求用户勾选知情后才能继续（例如身份 DLL 全冲突需覆盖游戏自带文件、或目录需提权）；`Info` 只展示（例如因冲突而换了身份、DX11 游戏走 interop 有 ~10% 损失）。
+Plan A CLI 没有 UI；执行器拒绝 `Blocking` 警告、`IdentityDecision.Status != Resolved` 和 `ElevationRequirement.Blocked`。CLI 的 `--no-sdk` 会产生阻塞警告，未知提权需求也会阻止部署。后续 UI 可将 `Blocking` 显示为禁用执行，将 `Caution` 作为需确认提示，`Info` 仅展示。
 
 ### 5.2 文件映射规则
 
@@ -265,7 +277,7 @@ public enum WarningSeverity { Info, Caution, Blocking }
 | 源 | 目标 | 说明 |
 |---|---|---|
 | `OptiScaler.dll` | `<部署目录>\<身份名>.dll` | **重命名副本**（copy 而非 move，同一份 payload 可装到多个游戏） |
-| `OptiScaler.ini` | `<部署目录>\OptiScaler.ini` | 不直拷：先经 `IniPatcher` 打 Profile + 游戏特定覆盖再落地 |
+| `OptiScaler.ini` | `<部署目录>\OptiScaler.ini` | 先经 `IniPatcher` 打 Profile + 游戏特定覆盖，以 `FileWrite.InlineContent` 携入计划 |
 | `OptiScaler\**` | `<部署目录>\OptiScaler\**` | FSR/XeSS 运行时、`D3D12_OptiScaler\` Agility、`plugins\`、`Licenses\` |
 | `Licenses\**` | `<部署目录>\Licenses\**` | |
 | `setup_windows.bat` / `setup_linux.sh` / `!! EXTRACT ALL FILES...` | **跳过** | 本工具即其替代品 |
@@ -296,21 +308,27 @@ public enum WarningSeverity { Info, Caution, Blocking }
 
 单文件：
 
-1. 目标已存在 → 先备份进影子目录，记 `BackupEntry`
+1. 执行前先把所有会被覆盖的原件拷进影子目录，并校验备份哈希
 2. 拷到 `<dest>.optideploy.tmp`
 3. 校验 tmp 的 SHA256 与计划中记录值一致（防拷贝中途损坏 / 磁盘满）
-4. `File.Replace(tmp, dest, dest + ".optideploy.bak")`；dest 原本不存在时退化为 `File.Move`
-5. 成功后删 `.optideploy.bak`（原件已在影子目录，不留第二份）
+4. 目标已存在时用 `File.Replace`；目标原本不存在时用 `File.Move`
+5. 写 INI 使用**无 BOM 的 UTF-8**。上游 INI 无 BOM，带 BOM 会使 SimpleIni 无法识别首个 section。
 
-整计划：执行时维护 `ExecutedSteps` 栈，**每步落盘到 `progress.json`**（进程被强杀后仍能续做回滚）。任一步失败 → 逆序回滚已完成步骤 → 抛 `DeploymentException` 附「已完成/已回滚」明细。Worker 进程同样落盘 `progress.json`，主进程在 Worker 崩溃时可据此接管回滚。
+`.optideploy.tmp` 或 `.optideploy.bak` 若已存在，writer 拒绝覆盖；`File.Replace` 失败时不会先删除目标再移动临时文件。该实现保留原件并报告失败，不做非原子回退。
+
+整计划：executor 先原子写入一个空白且不授权修改游戏目录的 manifest；所有原件备份并校验完成后，再一次写入完整备份项、目标路径和本次缺失目录列表，然后才开始修改游戏文件。每个成功写入步骤更新 `progress.json`，它用于诊断，不是回滚的依据。失败时 executor 尝试回滚并返回已完成步骤、错误及回滚结果；收到取消令牌时尝试回滚，再向调用方抛出取消异常。Plan A CLI 当前传入 `CancellationToken.None`，因此 CLI 中断时不会自动执行该取消回滚；用户可用已保存 manifest 手动恢复。Plan D Worker 已接入；崩溃时保留 manifest、progress 和 job 供明确恢复。
 
 ### 5.6 影子备份
 
 - 位置：`%LOCALAPPDATA%\OptiScalerDeployer\backups\<Fingerprint>\<PlanId>\`
 - `Fingerprint` = `<平台>|<PFN 或 InstallRoot>|<exe 名>` 的稳定哈希（8 位 hex），规避路径非法字符与超长
-- 目录内保持相对路径镜像 + `manifest.json`（PlanId、时间戳、Payload 版本、身份、全部 Backups、全部 Writes 目标路径、Profile 快照）
+- 目录内保持相对路径镜像 + `manifest.json`（PlanId、时间戳、Payload 版本、身份、全部 Backups、全部 Writes 目标路径、本次新建目录列表、Profile 快照）。目录列表是回滚清理新建空目录的依据。
 - 台账 `%LOCALAPPDATA%\OptiScalerDeployer\ledger.json` 只存索引（Fingerprint → 最新 PlanId + 备份根），明细在 manifest 里
-- 每个游戏保留最近 **3** 份 manifest，UI 可手动清理
+- `BackupStore.Prune` 提供显式清理 API。executor 暂不自动保留最近三份：多次部署的备份可能构成从当前状态回到初装前状态的恢复链，自动删除旧项会丢失这条链。
+
+`BackupEntry.Sha256` 在复制时由 `BackupStore` 计算：复制前哈希原件，复制后哈希备份件，二者不符即失败。备份阶段结束后，executor 才把带哈希的备份项发布进可回滚 manifest；在此之前磁盘上的空白 manifest 不含游戏目标，游戏文件也未变化。回滚先校验备份哈希，再经原子 writer 还原并核对结果。若还原失败，对应原路径仍受保护，不会被当成新增文件删除。旧 manifest 中 `Sha256` 为 null 时保留回滚兼容性，并用当前备份哈希校验复制过程；无法证明旧备份在更早时间没有损坏。
+
+manifest/progress 的 JSON 更新同样使用原子写。manifest 不存在是合法的“尚未执行”状态；文件存在但无法读取时必须保留内层异常原因并报告错误。`ListPlanIds` 可以列出损坏清单，但不会把损坏文件伪装成有效清单。
 
 ---
 
@@ -344,7 +362,7 @@ Xbox / GDK        : winmm → version → dbghelp → wininet → winhttp → dx
 
 ## 7. 游戏体检（Inspection）
 
-- **`PeImportReader`**：手写 COFF/PE 导入表解析（约 150 行，不引第三方库），返回导入的 DLL 名集合
+  - **`PeImportReader`**：读取 PE 导入表并返回 DLL 名集合；验证边界遵循[微软 PE 格式文档](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)
 - **`GraphicsApiDetector`**：导入 `d3d11.dll` → DX11；`d3d12.dll` / `d3d12core.dll` → DX12；`vulkan-1.dll` → Vulkan
 - **`UpscalerSdkDetector`**：导入表 + 目录实际文件双路检测
 
@@ -360,7 +378,7 @@ Xbox / GDK        : winmm → version → dbghelp → wininet → winhttp → dx
 - **`EngineDetector`**：存在 `Engine\` → UE，部署目录必须下探到 `Binaries\Win64`
 - **`InspectionReport`**：汇总以上 + `Recommendation`（推荐身份、推荐 `[Inputs]` 开关、警告列表、是否「游戏无任何超分 SDK → OptiScaler 无用武之地」）
 
-体检结果直接驱动身份决策与 Profile 中的 Input 开关，并在游戏列表里标注「不支持 / 无需 OptiScaler」。
+体检结果直接驱动身份决策与 Profile 中的 Input 开关，并在游戏列表里标注「不支持 / 无需 OptiScaler」。CLI 目前对原生 x64 PE 做静态检查；这不能证明游戏启动时实际加载该 SDK，也不检测反作弊、驱动或 GPU 兼容性。Streamline 插件和帧生成信号按可见 PE 导入与文件作有限判断。
 
 ---
 
@@ -476,6 +494,12 @@ App 层有全局 `IErrorPresenter`，把异常映射成 UI 上的「出了什么
 | 日志出现 Error/Fatal | 展示日志摘要 + 一键回滚 |
 | 下次扫描发现身份 DLL 消失 | 台账标 `NeedsReinstall`（Xbox 应用「修复/校验」会清掉它） |
 
+同一 PlanId 不能重放：executor 若发现该 manifest 已存在，会拒绝执行，以免覆盖最初的游戏原件备份。再次部署须生成新计划。多次部署后，单独回滚最新计划只恢复到前一版部署状态；若要完全卸载，需依次逆序回滚所有未回滚计划。CLI 只在回滚计划匹配台账的 `LatestPlanId` 时更新状态。
+
+用户 Profile 或安装台账读取失败时，CLI 会显示原因；写入保护不会把无法读取的原文件当成空数据覆盖。损坏 Profile 的原内容会尝试另存为 `.corrupt`，已有副本不会覆盖；若无法安全另存，后续写操作会被阻止。台账写入使用原子替换，坏台账不会被当成空台账覆盖。
+
+
+
 健康检查判据：
 
 - **成功信号**：日志出现 OptiScaler 版本行 + 选中的 upscaler 名称
@@ -508,12 +532,14 @@ Scanner 的 `libraryfolders.vdf` / `appmanifest_*.acf` / `PackageManager` 结果
 
 ### 11.3 手动验收清单（无法自动化）
 
+以下清单仍待手动游戏环境执行；Plan A/C 自动化测试使用合成 payload 和隔离目录，不能证明真实 GPU、驱动或游戏兼容性。Plan C 桌面界面已实现。
+
 - **开发机（N 卡）**：选一个 Steam DX12 游戏 → 部署 NVIDIA 档 → 启动 → `Insert` 出菜单 → 确认 Output = DLSS
 - **家里（RX 9070 XT）**：选一个 Xbox 游戏 → 部署 AMD 档 → 确认 `OptiScaler.log` 里 upscaler = FSR4、`amdxc64.dll` 加载成功、`Insert` 菜单可开
 
 ### 11.4 不测
 
-WPF View 层 —— 逻辑全部下沉到 ViewModel 与 Core，View 只做绑定。
+WPF View 层 UI 自动化 —— 逻辑由 ViewModel、应用服务与 Core 覆盖；窗口及控件本身不做自动化操作测试。App.Tests 不启动 WPF 窗口，并包含隔离临时磁盘上的服务端到端部署与回滚。
 
 ---
 

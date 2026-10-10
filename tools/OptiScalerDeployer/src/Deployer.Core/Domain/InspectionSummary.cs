@@ -1,8 +1,8 @@
 namespace Deployer.Core.Domain;
 
 /// <summary>
-/// 游戏体检结果中 planner 需要的部分。由计划 B 的 IGameInspector 填充；
-/// 计划 A 的 CLI 与测试手工构造。
+/// 游戏体检结果中 planner 需要的部分。Plan B 的 IGameInspector 填充该类型；
+/// 手工 PlanRequest 若不填可空帧生成字段，会沿用旧的 SDK 推断行为。
 /// </summary>
 public sealed record InspectionSummary
 {
@@ -10,6 +10,8 @@ public sealed record InspectionSummary
     public required IReadOnlyList<UpscalerSdk> DetectedSdks { get; init; }
     public required bool HasEngineFolder { get; init; }
     public required bool IsVulkanOnly { get; init; }
+    /// <summary>Whether Streamline DLSS-G frame generation was detected; null preserves older/manual request inference.</summary>
+    public bool? HasStreamlineFrameGen { get; init; }
 
     /// <summary>
     /// 游戏没有任何超分 SDK —— 装了 OptiScaler 也不会生效。

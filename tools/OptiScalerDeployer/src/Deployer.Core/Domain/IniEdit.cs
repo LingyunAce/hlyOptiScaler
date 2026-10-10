@@ -10,7 +10,11 @@ public sealed record IniEdit(string Section, string Key, string? OldValue, strin
 }
 
 /// <summary>一次文件写入。DestinationPath 为绝对路径。</summary>
-public sealed record FileWrite(string SourcePath, string DestinationPath, long Length, string Sha256);
+public sealed record FileWrite(
+    string SourcePath, string DestinationPath, long Length, string Sha256, string? InlineContent = null)
+{
+    public bool IsInline => InlineContent is not null;
+}
 
 /// <summary>
 /// 一条影子备份。Sha256 在 planner 阶段为 null（planner 不哈希游戏自带文件——太慢，

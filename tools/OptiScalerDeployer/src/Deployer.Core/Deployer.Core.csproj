@@ -5,5 +5,6 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.IO.Abstractions" />
+    <PackageReference Include="SharpCompress" />
   </ItemGroup>
 </Project>
