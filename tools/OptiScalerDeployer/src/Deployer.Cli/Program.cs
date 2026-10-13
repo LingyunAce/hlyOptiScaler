@@ -308,6 +308,7 @@ public static class Program
         var fs = new FileSystem();
         var manifestPath = Path.GetFullPath(o.Require("--manifest"));
         var backupRoot = Path.GetFullPath(o.Get("--backup-root") ?? BackupStore.DefaultRoot);
+        RollbackPrivilegePolicy.EnsureAllowedForCurrentProcess();
         var store = new BackupStore(fs, backupRoot);
         var manifest = store.ReadManifest(manifestPath)
             ?? throw new FileNotFoundException($"找不到备份清单：{manifestPath}", manifestPath);

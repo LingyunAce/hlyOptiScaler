@@ -27,7 +27,7 @@ public abstract class DeployerException : Exception
 public sealed class PayloadNotFoundException : DeployerException
 {
     public PayloadNotFoundException(string diagnostic)
-        : base("找不到 OptiScaler 产物。请先用 VS2022 构建一次 OptiScaler.sln，或在设置里手动指定产物目录。",
+        : base("无法获取 OptiScaler 文件。请检查网络后重试，或在设置中指定包含 OptiScaler.dll 和 OptiScaler.ini 的官方下载解压目录。",
                diagnostic) { }
 }
 

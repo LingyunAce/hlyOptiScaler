@@ -119,6 +119,52 @@ public class RollbackExecutorTests
     }
 
     [Fact]
+    public void Pending_write_with_original_bytes_is_a_safe_noop()
+    {
+        var id = Guid.NewGuid();
+        var original = Deploy + @"\version.dll";
+        var backupPath = BackupPath(id, "version.dll");
+        _fs.AddFile(original, new MockFileData("Game original"));
+        _fs.AddFile(backupPath, new MockFileData("Game original"));
+        var entry = new BackupEntry(original, backupPath, BackupReason.OverwriteGameFile,
+            Hashing.Sha256OfFile(_fs, backupPath));
+        var manifest = SaveManifest(id, new[] { entry }, Array.Empty<string>()) with
+        {
+            RecoveryStateVersion = 1,
+            PendingWrite = new PendingDeploymentWrite(original, Hashing.Sha256OfString("Opti replacement")),
+        };
+        _store.WriteManifest(manifest);
+
+        var result = _rollback.Rollback(_store.ManifestPathFor(Fingerprint, id));
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Equal("Game original", _fs.File.ReadAllText(original));
+    }
+
+    [Fact]
+    public void Pending_write_hash_conflict_is_reported_and_preserved_while_completed_prefix_is_rolled_back()
+    {
+        var id = Guid.NewGuid();
+        var completed = Deploy + @"\new.dll";
+        var pending = Deploy + @"\future.dll";
+        _fs.AddFile(completed, new MockFileData("Opti payload"));
+        _fs.AddFile(pending, new MockFileData("concurrent user file"));
+        var manifest = SaveManifest(id, Array.Empty<BackupEntry>(), new[] { completed }) with
+        {
+            RecoveryStateVersion = 1,
+            PendingWrite = new PendingDeploymentWrite(pending, Hashing.Sha256OfString("expected payload")),
+        };
+        _store.WriteManifest(manifest);
+
+        var result = _rollback.Rollback(_store.ManifestPathFor(Fingerprint, id));
+
+        Assert.False(result.Success);
+        Assert.False(_fs.File.Exists(completed));
+        Assert.Equal("concurrent user file", _fs.File.ReadAllText(pending));
+        Assert.Contains("内容与预期不符", result.ErrorMessage);
+    }
+
+    [Fact]
     public void Rejects_manifest_paths_outside_deployment_directory_without_deleting_them()
     {
         var outside = @"C:\game\important.dll";
@@ -200,5 +246,40 @@ public class RollbackExecutorTests
 
         Assert.True(result.Success);
         Assert.Equal(before, Snapshot(Deploy));
+    }
+
+    [Fact]
+    public void Rejects_reparse_point_in_restore_path_before_writing()
+    {
+        var id = Guid.NewGuid();
+        var original = Deploy + @"\Mods\version.dll";
+        var backupPath = BackupPath(id, "version.dll");
+        _fs.AddDirectory(Deploy + @"\Mods");
+        _fs.AddFile(original, new MockFileData("current"));
+        _fs.AddFile(backupPath, new MockFileData("original"));
+        _fs.File.SetAttributes(Deploy + @"\Mods", FileAttributes.Directory | FileAttributes.ReparsePoint);
+        SaveManifest(id, new[] { new BackupEntry(original, backupPath, BackupReason.OverwriteGameFile) }, new[] { original });
+
+        var result = _rollback.Rollback(_store.ManifestPathFor(Fingerprint, id));
+
+        Assert.False(result.Success);
+        Assert.Equal("current", _fs.File.ReadAllText(original));
+        Assert.Contains("reparse", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Rejects_reparse_point_before_deleting_created_file()
+    {
+        var id = Guid.NewGuid();
+        var path = Deploy + @"\Mods\new.dll";
+        _fs.AddDirectory(Deploy + @"\Mods");
+        _fs.AddFile(path, new MockFileData("new"));
+        _fs.File.SetAttributes(Deploy + @"\Mods", FileAttributes.Directory | FileAttributes.ReparsePoint);
+        SaveManifest(id, Array.Empty<BackupEntry>(), new[] { path });
+
+        var result = _rollback.Rollback(_store.ManifestPathFor(Fingerprint, id));
+
+        Assert.False(result.Success);
+        Assert.True(_fs.File.Exists(path));
     }
 }

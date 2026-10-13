@@ -267,6 +267,7 @@ public sealed class DefaultDeployerAppService : IDeployerAppService
         if (!_applyGate.Wait(0)) return new RollbackWorkflowResult(false, false, fullManifestPath, "已有部署或回滚操作正在执行。", null);
         try
         {
+            RollbackPrivilegePolicy.EnsureAllowedForCurrentProcess();
             EnsureLedgerStore();
             cancellationToken.ThrowIfCancellationRequested();
             var root = _fs.Path.GetDirectoryName(_fs.Path.GetDirectoryName(_fs.Path.GetDirectoryName(fullManifestPath))!);
@@ -275,8 +276,9 @@ public sealed class DefaultDeployerAppService : IDeployerAppService
             var recoveryManifest = backups.ReadManifest(fullManifestPath);
             if (recoveryManifest is not null && _probe(recoveryManifest.DeployDirectory) == DirectoryWritability.NeedsElevation)
                 return new RollbackWorkflowResult(false, false, fullManifestPath,
-                    "此目录恢复需要管理员权限；桌面回滚尚未执行。",
-                    $"在管理员终端运行 CLI：rollback --manifest \"{fullManifestPath}\" --backup-root \"{root}\" --ledger \"{_ledgerPath}\"。先检查清单与备份，按时间从新到旧恢复。");
+                    "此目录恢复需要管理员权限；当前版本会拒绝管理员权限下的路径型回滚。游戏文件未更改。",
+                    "请保留备份清单与备份文件。本版本暂不支持安全的管理员恢复；不要通过管理员终端运行 CLI 回滚。若目录权限允许普通用户写入，请恢复权限后以普通用户重新打开软件并回滚。清单："
+                    + fullManifestPath + "；备份根目录：" + root);
             var rollback = new RollbackExecutor(_fs, new AtomicFileWriter(_fs), backups).Rollback(fullManifestPath);
             if (!rollback.Success)
                 return new RollbackWorkflowResult(false, false, fullManifestPath, rollback.ErrorMessage, rollback.ErrorMessage);

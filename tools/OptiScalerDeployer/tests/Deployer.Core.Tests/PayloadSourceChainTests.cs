@@ -63,7 +63,9 @@ public class PayloadSourceChainTests
 
         Assert.Contains("本地构建", ex.Diagnostic);
         Assert.Contains("手动指定", ex.Diagnostic);
-        Assert.Contains("VS2022", ex.UserMessage);
+        Assert.Contains("官方下载解压目录", ex.UserMessage);
+        Assert.Contains("OptiScaler.dll", ex.UserMessage);
+        Assert.Contains("OptiScaler.ini", ex.UserMessage);
     }
 
     [Fact]

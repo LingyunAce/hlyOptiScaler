@@ -25,9 +25,15 @@ public sealed record DeploymentManifest
     public required UpscalerProfile Profile { get; init; }
     public required IReadOnlyList<BackupEntry> Backups { get; init; }
 
-    /// <summary>本次新增/覆盖的全部目标路径。无对应 BackupEntry 的即为「纯新增」，回滚时直接删。</summary>
+    /// <summary>Recovery contract 1 下已经完成的连续写入前缀；旧清单中表示其记录的写入路径。</summary>
     public required IReadOnlyList<string> WrittenPaths { get; init; }
+
+    /// <summary>Recovery contract 1: completed prefix is authoritative; this optional write is write-ahead intent.</summary>
+    public int RecoveryStateVersion { get; init; }
+    public PendingDeploymentWrite? PendingWrite { get; init; }
 
     /// <summary>部署期间新建的目录，回滚时仅在目录为空时删除；缺失表示旧版清单未记录目录。</summary>
     public IReadOnlyList<string> CreatedDirectories { get; init; } = Array.Empty<string>();
 }
+
+public sealed record PendingDeploymentWrite(string Path, string Sha256);

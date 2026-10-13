@@ -85,7 +85,7 @@ public sealed class DefaultDeployerAppServiceTests
         }
     }
     [Fact]
-    public async Task Protected_recovery_returns_exact_administrator_command_without_modifying_deployment()
+    public async Task Protected_recovery_preserves_manifest_and_backups_without_modifying_deployment()
     {
         using var workspace = new AppWorkspace(); var (game, executable) = workspace.CreateGame();
         var service = workspace.CreateService();
@@ -95,9 +95,11 @@ public sealed class DefaultDeployerAppServiceTests
         var before = Snapshot(workspace.GameRoot);
         var protectedService = workspace.CreateService(probe: _ => DirectoryWritability.NeedsElevation);
         var recovery = await protectedService.RollbackAsync(installed.ManifestPath);
-        Assert.False(recovery.Success); Assert.Contains("管理员", recovery.ErrorMessage);
+        Assert.False(recovery.Success); Assert.Contains("管理员权限", recovery.ErrorMessage);
+        Assert.Contains("暂不支持安全的管理员恢复", recovery.DiagnosticDetails);
+        Assert.Contains("保留", recovery.DiagnosticDetails);
         Assert.Contains(installed.ManifestPath, recovery.DiagnosticDetails); Assert.Contains(workspace.BackupRoot, recovery.DiagnosticDetails);
-        Assert.Contains(workspace.LedgerPath, recovery.DiagnosticDetails); AssertTreeEqual(before, Snapshot(workspace.GameRoot));
+        AssertTreeEqual(before, Snapshot(workspace.GameRoot));
     }
     [Fact]
     public async Task Plan_apply_duplicate_apply_and_rollback_round_trip_only_inside_test_workspace()

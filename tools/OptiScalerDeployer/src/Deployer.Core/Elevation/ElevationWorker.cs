@@ -44,7 +44,7 @@ public static class ElevationWorker
     public static Action<DeploymentManifest> CreateRecoveryValidator(ElevationRequest request)
     {
         var plan = request.Plan; var fs = new FileSystem(); var writer = new AtomicFileWriter(fs);
-        var writes = plan.Writes.Select(w => Path.GetFullPath(w.DestinationPath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var writes = plan.Writes.Select(w => Path.GetFullPath(w.DestinationPath)).ToArray();
         var directories = plan.Writes.SelectMany(w => writer.MissingDirectories(w.DestinationPath)).Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var originals = plan.Backups.ToDictionary(b => Path.GetFullPath(b.OriginalPath),
             b => (Path: Path.GetFullPath(b.BackupPath), Hash: Hashing.Sha256OfFile(fs, b.OriginalPath)), StringComparer.OrdinalIgnoreCase);
@@ -53,11 +53,22 @@ public static class ElevationWorker
         {
             if (manifest.PlanId != plan.PlanId || manifest.Fingerprint != plan.Game.Fingerprint
                 || !Path.GetFullPath(manifest.DeployDirectory).Equals(Path.GetFullPath(plan.Game.DeployDirectory), StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Recovery manifest does not match the reviewed plan.");
-            var paths = manifest.WrittenPaths.Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            if (paths.Count != manifest.WrittenPaths.Count || !paths.SetEquals(writes) || manifest.Backups.Count != originals.Count
-                || manifest.Backups.Select(b => Path.GetFullPath(b.OriginalPath)).Distinct(StringComparer.OrdinalIgnoreCase).Count() != originals.Count)
-                throw new InvalidDataException("Recovery manifest has missing or unapproved operations.");
-            foreach (var path in paths)
+            var paths = manifest.WrittenPaths.Select(Path.GetFullPath).ToArray();
+            if (manifest.RecoveryStateVersion != 1 || paths.Length > writes.Length
+                || !paths.SequenceEqual(writes.Take(paths.Length), StringComparer.OrdinalIgnoreCase))
+                throw new InvalidDataException("Recovery manifest has a non-prefix or unapproved write sequence.");
+            if (manifest.PendingWrite is { } pending
+                && (paths.Length >= writes.Length
+                    || !Path.GetFullPath(pending.Path).Equals(writes[paths.Length], StringComparison.OrdinalIgnoreCase)
+                    || !pending.Sha256.Equals(plan.Writes[paths.Length].Sha256, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidDataException("Recovery manifest pending write does not match the next reviewed operation.");
+            var recoveryPaths = paths.Concat(manifest.PendingWrite is null ? Array.Empty<string>() : new[] { manifest.PendingWrite.Path });
+            var recoveryPathSet = recoveryPaths.Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var expectedBackups = originals.Keys.Where(recoveryPathSet.Contains).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (manifest.Backups.Select(b => Path.GetFullPath(b.OriginalPath)).Distinct(StringComparer.OrdinalIgnoreCase).Count() != manifest.Backups.Count
+                || !manifest.Backups.Select(b => Path.GetFullPath(b.OriginalPath)).ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(expectedBackups))
+                throw new InvalidDataException("Recovery manifest backups do not match attempted reviewed writes.");
+            foreach (var path in recoveryPaths)
             {
                 ElevationPolicy.ValidateTarget(path, plan.Game.DeployDirectory);
                 ElevationPolicy.ValidateTarget(path + ".optideploy.tmp", plan.Game.DeployDirectory);
@@ -120,9 +131,31 @@ public static class ElevationWorker
         { result = new(job.JobId, false, "Cancelled", manifestPath, completed, "Deployment cancelled; inspect the manifest before recovery.", File.Exists(manifestPath)); }
         catch (Exception ex)
         { result = new(job.JobId, false, "Rejected", manifestPath, completed, ex.Message, File.Exists(manifestPath)); }
-        if (manifestPath is not null && File.Exists(Path.Combine(Path.GetDirectoryName(manifestPath)!, "progress.json")))
+        if (manifestPath is not null && File.Exists(manifestPath))
         {
-            try { result = result with { CompletedSteps = DeployerJson.Deserialize<DeploymentProgress>(File.ReadAllText(Path.Combine(Path.GetDirectoryName(manifestPath)!, "progress.json"))).CompletedSteps }; } catch { }
+            try
+            {
+                var fs = new FileSystem();
+                var manifest = DeployerJson.Deserialize<DeploymentManifest>(File.ReadAllText(manifestPath));
+                IReadOnlyList<string> steps;
+                if (manifest.RecoveryStateVersion == 1)
+                {
+                    var authoritative = manifest.WrittenPaths.ToList();
+                    if (manifest.PendingWrite is { } pending && File.Exists(pending.Path)
+                        && Hashing.Sha256OfFile(fs, pending.Path).Equals(pending.Sha256, StringComparison.OrdinalIgnoreCase))
+                        authoritative.Add(pending.Path);
+                    steps = authoritative;
+                }
+                else
+                {
+                    var progressPath = Path.Combine(Path.GetDirectoryName(manifestPath)!, "progress.json");
+                    steps = File.Exists(progressPath)
+                        ? DeployerJson.Deserialize<DeploymentProgress>(File.ReadAllText(progressPath)).CompletedSteps
+                        : result.CompletedSteps;
+                }
+                result = result with { CompletedSteps = steps };
+            }
+            catch { }
         }
         if (outputSafe)
         {

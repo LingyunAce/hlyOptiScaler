@@ -32,7 +32,9 @@ public class DeployerExceptionTests
         Assert.Equal(ex.UserMessage, ex.Message);
 
         // 用户话术还得是**可操作**的指引：告诉用户怎么修，而不是甩一串技术黑话
-        Assert.Contains("OptiScaler.sln", ex.Message);
+        Assert.Contains("官方下载解压目录", ex.Message);
+        Assert.Contains("OptiScaler.dll", ex.Message);
+        Assert.DoesNotContain("VS2022", ex.Message);
         Assert.DoesNotContain(FakeDiagnostic, ex.Message);
     }
 

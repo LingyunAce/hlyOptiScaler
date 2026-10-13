@@ -18,10 +18,12 @@ public sealed class RunAsJobTransport(string workerPath, Func<ProcessStartInfo, 
     {
         ct.ThrowIfCancellationRequested();
         ElevationPolicy.ValidateJob(job);
+        using var workerTrust = WorkerTrust.Acquire(workerPath);
         var request = ElevationJobStore.Read(job);
         ElevationWorker.ValidateRequest(job, request);
         var manifest = Path.Combine(request.BackupRoot, request.Plan.Game.Fingerprint, request.Plan.PlanId.ToString("D"), "manifest.json");
-        var psi = new ProcessStartInfo(Path.GetFullPath(workerPath), $"--job-dir \"{job.JobDirectory}\" --sha256 {job.PlanSha256}") { UseShellExecute = true, Verb = "runas", WorkingDirectory = job.JobDirectory };
+        var fullWorkerPath = Path.GetFullPath(workerPath);
+        var psi = new ProcessStartInfo(fullWorkerPath, $"--job-dir \"{job.JobDirectory}\" --sha256 {job.PlanSha256}") { UseShellExecute = true, Verb = "runas", WorkingDirectory = Path.GetDirectoryName(fullWorkerPath)! };
         try
         {
             using var process = (launch ?? Process.Start)(psi) ?? throw new InvalidOperationException("Worker could not start.");
@@ -42,9 +44,44 @@ public sealed class RunAsJobTransport(string workerPath, Func<ProcessStartInfo, 
                 if (result.Success && (result.Status != "Completed" || !File.Exists(manifest))) throw new InvalidDataException("Worker success has no recovery manifest.");
                 return result;
             }
-            var steps = Array.Empty<string>(); var progressPath = Path.Combine(Path.GetDirectoryName(manifest)!, "progress.json");
-            try { ElevationPolicy.RejectReparseAncestors(progressPath); if (File.Exists(progressPath)) steps = DeployerJson.Deserialize<Deployer.Core.Domain.DeploymentProgress>(File.ReadAllText(progressPath)).CompletedSteps.ToArray(); } catch { }
-            return new(job.JobId, false, "WorkerCrashed", manifest, steps, "Worker exited without result; inspect progress and manifest.", true);
+            IReadOnlyList<string> steps = Array.Empty<string>();
+            var usedLegacyProgress = false;
+            var foundV1Manifest = false;
+            try
+            {
+                ElevationPolicy.RejectReparseAncestors(manifest);
+                if (File.Exists(manifest) && new FileInfo(manifest).Length <= 1024 * 1024)
+                {
+                    var saved = DeployerJson.Deserialize<Deployer.Core.Domain.DeploymentManifest>(File.ReadAllText(manifest));
+                    if (saved.RecoveryStateVersion == 1)
+                    {
+                        foundV1Manifest = true;
+                        var expectedWrites = request.Plan.Writes.Select(w => Path.GetFullPath(w.DestinationPath)).ToArray();
+                        var savedWrites = saved.WrittenPaths.Select(Path.GetFullPath).ToArray();
+                        if (saved.PlanId != request.Plan.PlanId || saved.Fingerprint != request.Plan.Game.Fingerprint
+                            || !Path.GetFullPath(saved.DeployDirectory).Equals(Path.GetFullPath(request.Plan.Game.DeployDirectory), StringComparison.OrdinalIgnoreCase)
+                            || savedWrites.Length > expectedWrites.Length
+                            || !savedWrites.SequenceEqual(expectedWrites.Take(savedWrites.Length), StringComparer.OrdinalIgnoreCase))
+                            throw new InvalidDataException("Worker manifest completed prefix does not match this job.");
+                        steps = saved.WrittenPaths.ToArray();
+                    }
+                    else usedLegacyProgress = true;
+                }
+                else usedLegacyProgress = true;
+            }
+            catch { usedLegacyProgress = !foundV1Manifest; }
+            if (usedLegacyProgress)
+            {
+                var progressPath = Path.Combine(Path.GetDirectoryName(manifest)!, "progress.json");
+                try
+                {
+                    ElevationPolicy.RejectReparseAncestors(progressPath);
+                    if (File.Exists(progressPath) && new FileInfo(progressPath).Length <= 1024 * 1024)
+                        steps = DeployerJson.Deserialize<Deployer.Core.Domain.DeploymentProgress>(File.ReadAllText(progressPath)).CompletedSteps.ToArray();
+                }
+                catch { }
+            }
+            return new(job.JobId, false, "WorkerCrashed", manifest, steps, "Worker exited without result; inspect the recovery manifest.", true);
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) { return new(job.JobId, false, "Declined", null, Array.Empty<string>(), "UAC was declined.", true); }
     }
@@ -52,6 +89,11 @@ public sealed class RunAsJobTransport(string workerPath, Func<ProcessStartInfo, 
 
 public static class ElevationPolicy
 {
+    public static void ValidateWorkerPath(string workerPath)
+    {
+        using var _ = WorkerTrust.Acquire(workerPath);
+    }
+
     public static void ValidateJob(ElevationJob job)
     {
         ValidateJobDirectory(job);

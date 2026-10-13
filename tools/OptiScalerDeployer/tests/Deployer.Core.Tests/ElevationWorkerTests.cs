@@ -102,5 +102,45 @@ public sealed class ElevationWorkerTests : IDisposable
         Assert.False(rollback.Success); Assert.Equal("keep", File.ReadAllText(victim));
     }
 
+    [Fact]
+    public async Task Partial_worker_recovery_accepts_only_next_pending_write_and_restores_existing_ini()
+    {
+        var plan = Plan();
+        var root = Path.Combine(_root, "backups");
+        var validate = ElevationWorker.CreateRecoveryValidator(new(plan, root));
+        var result = await ElevationWorker.ExecuteAsync(Job(plan));
+        Assert.True(result.Success, result.Error);
+
+        var ini = Path.Combine(plan.Game.DeployDirectory, "OptiScaler.ini");
+        var iniIndex = plan.Writes.ToList().FindIndex(write =>
+            Path.GetFullPath(write.DestinationPath).Equals(Path.GetFullPath(ini), StringComparison.OrdinalIgnoreCase));
+        Assert.True(iniIndex >= 0);
+        var manifestPath = result.ManifestPath!;
+        var fs = new FileSystem();
+        var store = new BackupStore(fs, root);
+        var manifest = store.ReadManifest(manifestPath)!;
+        var prefix = plan.Writes.Take(iniIndex).Select(write => write.DestinationPath).ToArray();
+        var pending = new PendingDeploymentWrite(ini, plan.Writes[iniIndex].Sha256);
+        store.WriteManifest(manifest with
+        {
+            WrittenPaths = prefix,
+            PendingWrite = pending,
+            RecoveryStateVersion = 1,
+        });
+
+        var rollback = new RollbackExecutor(fs, new AtomicFileWriter(fs), store, validate).Rollback(manifestPath);
+
+        Assert.True(rollback.Success, rollback.ErrorMessage);
+        Assert.Equal("old-ini", File.ReadAllText(ini));
+
+        var forged = manifest with
+        {
+            WrittenPaths = Array.Empty<string>(),
+            PendingWrite = new PendingDeploymentWrite(plan.Game.DeployDirectory + Path.DirectorySeparatorChar + "not-in-plan.dll", new string('0', 64)),
+            RecoveryStateVersion = 1,
+        };
+        Assert.Throws<InvalidDataException>(() => validate(forged));
+    }
+
     public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, true); }
 }

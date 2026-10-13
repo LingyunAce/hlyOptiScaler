@@ -52,7 +52,7 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
             var backups = new List<BackupEntry>();
 
             // Publish a safe empty manifest first. It cannot authorize deleting or replacing any game file.
-            WriteManifest(plan, manifestPath, backups, Array.Empty<string>(), Array.Empty<string>());
+            WriteState(plan, manifestPath, backups, Array.Empty<string>(), Array.Empty<string>(), null);
             manifestPublished = true;
 
             foreach (var entry in plan.Backups)
@@ -68,42 +68,50 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
             EnsureDestinationsStillMatchPlan(plan, backups);
             var createdDirs = plan.Writes.SelectMany(w => _writer.MissingDirectories(w.DestinationPath))
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            var written = plan.Writes.Select(w => w.DestinationPath).ToList();
-            WriteManifest(plan, manifestPath, backups, written, createdDirs);
-            _backups.WriteProgress(DeploymentProgress.Empty(plan.PlanId, manifestPath));
+            // Keep the recovery manifest limited to writes that have actually completed.
+            // Publishing the complete plan here would allow rollback to delete a file that
+            // was never written by this run (for example after a mid-deployment crash).
+            WriteState(plan, manifestPath, backups, Array.Empty<string>(), createdDirs, null);
 
             foreach (var write in plan.Writes)
             {
                 ct.ThrowIfCancellationRequested();
                 _validateExecution?.Invoke();
                 EnsureDestinationStillMatchesPlan(write.DestinationPath, backups);
+                var pending = new PendingDeploymentWrite(write.DestinationPath, write.Sha256);
+                // Write-ahead intent closes the crash window between the atomic game-file
+                // replacement and publishing the completed prefix. Recovery deletes/restores
+                // this target only when its bytes match this expected hash.
+                WriteState(plan, manifestPath, backups, completed, createdDirs, pending);
                 gameWriteStarted = true;
                 _writer.Write(write);
                 completed.Add(write.DestinationPath);
+                WriteState(plan, manifestPath, backups, completed, createdDirs, null);
                 _validateExecution?.Invoke();
-                _backups.WriteProgress(new DeploymentProgress
-                {
-                    PlanId = plan.PlanId,
-                    ManifestPath = manifestPath,
-                    CompletedSteps = completed.ToList(),
-                });
             }
 
             return new DeploymentResult(true, manifestPath, completed, null, false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException ex)
         {
             if (manifestPublished && gameWriteStarted)
             {
-                TryRollback(manifestPath);
+                if (!TryRollback(manifestPath, out var recoveryError))
+                    throw new OperationCanceledException(
+                        $"部署已取消，但自动恢复未完成。恢复清单已保留，请关闭管理员权限并在普通用户会话中恢复。{recoveryError}", ex, ct);
             }
 
             throw;
         }
         catch (Exception ex)
         {
-            var rolledBack = manifestPublished && gameWriteStarted && TryRollback(manifestPath);
+            var rolledBack = false;
+            string? recoveryError = null;
+            if (manifestPublished && gameWriteStarted)
+                rolledBack = TryRollback(manifestPath, out recoveryError);
             var message = ex is DeployerException ? ex.Message : $"部署失败：{ex.Message}";
+            if (manifestPublished && gameWriteStarted && !rolledBack)
+                message += $"\n自动恢复未完成，恢复清单已保留，请关闭管理员权限并在普通用户会话中恢复。{recoveryError}";
             return Failed(manifestPath, completed, message, rolledBack);
         }
     }
@@ -230,8 +238,9 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
         }
     }
 
-    private void WriteManifest(DeploymentPlan plan, string path, IReadOnlyList<BackupEntry> backups,
-        IReadOnlyList<string> written, IReadOnlyList<string> createdDirectories) =>
+    private void WriteState(DeploymentPlan plan, string path, IReadOnlyList<BackupEntry> backups,
+        IReadOnlyList<string> written, IReadOnlyList<string> createdDirectories, PendingDeploymentWrite? pending)
+    {
         WriteValidatedManifest(new DeploymentManifest
         {
             PlanId = plan.PlanId,
@@ -242,10 +251,24 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
             Payload = plan.Payload,
             Identity = plan.Identity,
             Profile = plan.Profile,
-            Backups = backups.ToList(),
+            Backups = backups.Where(backup => written.Concat(pending is null
+                    ? Array.Empty<string>()
+                    : new[] { pending.Path })
+                .Any(path => FullPath(path).Equals(FullPath(backup.OriginalPath), StringComparison.OrdinalIgnoreCase)))
+                .ToList(),
             WrittenPaths = written.ToList(),
+            RecoveryStateVersion = 1,
+            PendingWrite = pending,
             CreatedDirectories = createdDirectories.ToList(),
         });
+        _backups.WriteProgress(new DeploymentProgress
+        {
+            PlanId = plan.PlanId,
+            ManifestPath = path,
+            CompletedSteps = written.ToList(),
+            PendingWrite = pending,
+        });
+    }
 
     private void WriteValidatedManifest(DeploymentManifest manifest)
     {
@@ -253,20 +276,25 @@ public sealed class DeploymentExecutor : IDeploymentExecutor
         _backups.WriteManifest(manifest);
     }
 
-    private bool TryRollback(string manifestPath)
+    private bool TryRollback(string manifestPath, out string? recoveryError)
     {
+        recoveryError = null;
         if (_rollback is null)
         {
+            recoveryError = "当前没有可用的回滚器。";
             return false;
         }
 
         try
         {
             _validateExecution?.Invoke();
-            return _rollback.Rollback(manifestPath).Success;
+            var result = _rollback.Rollback(manifestPath);
+            recoveryError = result.ErrorMessage;
+            return result.Success;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            recoveryError = ex.Message;
             return false;
         }
     }

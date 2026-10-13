@@ -55,6 +55,7 @@ public class DeploymentExecutorTests
     {
         private readonly IBackupStore _inner;
         public Action? BeforeManifest { get; init; }
+        public Action<DeploymentManifest>? ManifestHook { get; init; }
         public Func<BackupEntry, BackupEntry>? BackupHook { get; init; }
         public Action<DeploymentProgress>? AfterProgress { get; init; }
 
@@ -66,6 +67,7 @@ public class DeploymentExecutorTests
         public void WriteManifest(DeploymentManifest manifest)
         {
             BeforeManifest?.Invoke();
+            ManifestHook?.Invoke(manifest);
             _inner.WriteManifest(manifest);
         }
         public DeploymentManifest? ReadManifest(string path) => _inner.ReadManifest(path);
@@ -130,6 +132,99 @@ public class DeploymentExecutorTests
         Assert.True(result.RolledBack);
         Assert.False(_fs.File.Exists(Path.Combine(plan.Game.DeployDirectory, plan.Identity.FileName)));
         Assert.True(_fs.File.Exists(Path.Combine(plan.Game.DeployDirectory, plan.Game.ExecutableName)));
+    }
+
+    [Fact]
+    public void Recovery_manifest_never_authorizes_a_future_plan_path()
+    {
+        var plan = BuildPlan();
+        var inner = new BackupStore(_fs, BackupRoot);
+        var laterPath = plan.Writes[^2].DestinationPath;
+        var failedAfterFirstProgress = false;
+        var store = new HookBackupStore(inner)
+        {
+            AfterProgress = progress =>
+            {
+                if (!failedAfterFirstProgress && progress.CompletedSteps.Count == 1)
+                {
+                    failedAfterFirstProgress = true;
+                    _fs.AddFile(laterPath, new MockFileData("created by another process"));
+                }
+            },
+        };
+
+        var result = Executor(store).Execute(plan, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.True(result.RolledBack);
+        Assert.Equal("created by another process", _fs.File.ReadAllText(laterPath));
+    }
+
+    [Fact]
+    public void Pending_write_recovers_file_when_completed_manifest_publish_fails_after_atomic_write()
+    {
+        var plan = BuildPlan(existingIdentity: true);
+        var original = plan.Backups[0].OriginalPath;
+        var inner = new BackupStore(_fs, BackupRoot);
+        var target = plan.Writes.Single(write => Path.GetFullPath(write.DestinationPath)
+            .Equals(Path.GetFullPath(original), StringComparison.OrdinalIgnoreCase)).DestinationPath;
+        var failed = false;
+        var store = new HookBackupStore(inner)
+        {
+            ManifestHook = manifest =>
+            {
+                if (!failed && manifest.WrittenPaths.Contains(target, StringComparer.OrdinalIgnoreCase))
+                {
+                    failed = true;
+                    throw new IOException("simulated crash after game write before completed manifest");
+                }
+            },
+        };
+
+        var result = Executor(store).Execute(plan, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.True(result.RolledBack);
+        Assert.Equal("game-owned original", _fs.File.ReadAllText(original));
+        Assert.True(_fs.File.Exists(target));
+    }
+
+    [Fact]
+    public void Rollback_does_not_delete_a_file_created_after_manifest_before_first_write()
+    {
+        var plan = BuildPlan();
+        var inner = new BackupStore(_fs, BackupRoot);
+        var laterPath = plan.Writes[^2].DestinationPath;
+        var laterDirectory = Path.Combine(plan.Game.DeployDirectory, "OptiScaler");
+        var emptyProgressWrites = 0;
+        var store = new HookBackupStore(inner)
+        {
+            AfterProgress = progress =>
+            {
+                if (progress.CompletedSteps.Count == 0 && ++emptyProgressWrites == 2)
+                {
+                    _fs.AddFile(laterPath, new MockFileData("created after manifest"));
+                    _fs.AddDirectory(laterDirectory);
+                    throw new IOException("simulated interruption before first write");
+                }
+            },
+        };
+
+        var result = Executor(store).Execute(plan, CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.True(_fs.File.Exists(result.ManifestPath));
+        var savedManifest = inner.ReadManifest(result.ManifestPath)!;
+        var savedProgress = inner.ReadProgress(inner.ProgressPathFor(savedManifest.Fingerprint, savedManifest.PlanId))!;
+        Assert.Empty(savedProgress.CompletedSteps);
+        Assert.Empty(savedManifest.WrittenPaths);
+        Assert.Contains(laterDirectory, savedManifest.CreatedDirectories);
+        Assert.True(_fs.Directory.Exists(laterDirectory));
+
+        var rollback = new RollbackExecutor(_fs, new AtomicFileWriter(_fs), inner).Rollback(result.ManifestPath);
+
+        Assert.True(rollback.Success, rollback.ErrorMessage);
+        Assert.Equal("created after manifest", _fs.File.ReadAllText(laterPath));
+        Assert.True(_fs.Directory.Exists(laterDirectory));
     }
 
     [Fact]

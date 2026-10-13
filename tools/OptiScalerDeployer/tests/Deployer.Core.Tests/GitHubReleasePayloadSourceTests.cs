@@ -25,6 +25,72 @@ public sealed class GitHubReleasePayloadSourceTests : IDisposable
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
             Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("API rate limit exceeded") });
     }
+
+    private sealed class StableFallbackHandler(HttpStatusCode status, byte[] asset) : HttpMessageHandler
+    {
+        public List<Uri> Requests { get; } = [];
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            Requests.Add(request.RequestUri!);
+            if (request.RequestUri!.Host == "api.github.com")
+                return Task.FromResult(new HttpResponseMessage(status) { ReasonPhrase = "API rate limit exceeded" });
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(asset) });
+        }
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Forbidden, "403")]
+    [InlineData(HttpStatusCode.TooManyRequests, "429")]
+    public async Task Stable_rate_limit_uses_only_the_pinned_official_asset_and_preserves_failure_diagnostics(HttpStatusCode status, string statusText)
+    {
+        var handler = new StableFallbackHandler(status, [1, 2, 3]);
+        using var http = new HttpClient(handler);
+        var source = new GitHubReleasePayloadSource(http, _root);
+
+        Assert.Null(await source.TryGetAsync(default));
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal("api.github.com", handler.Requests[0].Host);
+        Assert.Equal("/repos/OptiScaler/OptiScaler/releases/latest", handler.Requests[0].AbsolutePath);
+        Assert.Equal("https", handler.Requests[1].Scheme);
+        Assert.Equal("github.com", handler.Requests[1].Host);
+        Assert.Equal("/optiscaler/OptiScaler/releases/download/v0.9.4/Optiscaler_0.9.4-final.20260718._MM.7z", handler.Requests[1].AbsolutePath);
+        Assert.Contains(statusText, source.LastError);
+        Assert.Contains("SHA256 did not match", source.LastError);
+        Assert.False(Directory.Exists(Path.Combine(_root, "v0.9.4", "content")));
+    }
+
+    [Fact]
+    public async Task Nightly_rate_limit_does_not_fall_back_to_stable()
+    {
+        var handler = new StableFallbackHandler(HttpStatusCode.Forbidden, [1, 2, 3]);
+        using var http = new HttpClient(handler);
+        var source = new GitHubReleasePayloadSource(http, _root, "nightly");
+
+        Assert.Null(await source.TryGetAsync(default));
+        Assert.Single(handler.Requests);
+        Assert.Equal("/repos/OptiScaler/OptiScaler/releases/tags/nightly", handler.Requests[0].AbsolutePath);
+        Assert.Contains("403", source.LastError);
+    }
+
+    [Fact]
+    public async Task Cancellation_during_metadata_request_propagates()
+    {
+        using var http = new HttpClient(new BlockingHandler());
+        var source = new GitHubReleasePayloadSource(http, _root, timeout: TimeSpan.FromMinutes(1));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => source.TryGetAsync(cts.Token));
+    }
+
+    private sealed class BlockingHandler : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return new HttpResponseMessage(HttpStatusCode.Forbidden);
+        }
+    }
     [Fact]
     public async Task Http_failure_keeps_actionable_status_diagnostic()
     {

@@ -12,6 +12,9 @@ namespace Deployer.Core.Payload;
 public sealed class GitHubReleasePayloadSource : IPayloadSource
 {
     private const string ApiRoot = "https://api.github.com/repos/OptiScaler/OptiScaler/releases";
+    private const string RateLimitedStableTag = "v0.9.4";
+    private const string RateLimitedStableUrl = "https://github.com/optiscaler/OptiScaler/releases/download/v0.9.4/Optiscaler_0.9.4-final.20260718._MM.7z";
+    private const string RateLimitedStableDigest = "575cb4df866116093df75af607e37fd70e10f5163e0f23fd5c804142e80ef0ad";
     private readonly HttpClient _http;
     private readonly string _cacheRoot;
     private readonly string _channel;
@@ -44,61 +47,80 @@ public sealed class GitHubReleasePayloadSource : IPayloadSource
         LastError = null;
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct); deadline.CancelAfter(_timeout);
         var callerToken = ct; ct = deadline.Token;
+        string? fallbackDiagnostic = null;
         try
         {
             using var response = await GetOfficialAsync(new Uri(_channel == "nightly" ? ApiRoot + "/tags/nightly" : ApiRoot + "/latest"), ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
+            JsonDocument doc;
+            if (_channel == "stable" && (int)response.StatusCode is 403 or 429)
             {
-                LastError = $"GitHub Releases metadata returned HTTP {(int)response.StatusCode} ({response.ReasonPhrase}). For HTTP 403/429, retry after the API limit resets or select a manual payload directory.";
-                return null;
+                fallbackDiagnostic = $"GitHub Releases metadata returned HTTP {(int)response.StatusCode} ({response.ReasonPhrase}); using pinned official stable {RateLimitedStableTag}, which may not be the latest release.";
+                doc = JsonDocument.Parse(JsonSerializer.Serialize(new
+                {
+                    tag_name = RateLimitedStableTag,
+                    assets = new[] { new { name = "Optiscaler_0.9.4-final.20260718._MM.7z", browser_download_url = RateLimitedStableUrl, digest = "sha256:" + RateLimitedStableDigest } }
+                }));
             }
-            await using var metadata = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            using var bounded = new MemoryStream();
-            var metadataBuffer = new byte[8192]; int read;
-            while ((read = await metadata.ReadAsync(metadataBuffer, ct).ConfigureAwait(false)) > 0)
-            { if (bounded.Length + read > 2 * 1024 * 1024) throw new InvalidDataException("Release metadata limit."); bounded.Write(metadataBuffer, 0, read); }
-            using var doc = JsonDocument.Parse(bounded.ToArray());
-            var root = doc.RootElement; var tag = root.GetProperty("tag_name").GetString();
-            if (string.IsNullOrWhiteSpace(tag) || tag is "." or ".." || tag.Length > 100 || tag.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('.' or '-' or '_'))) return null;
-            var asset = SelectAsset(root); if (asset is null) return null;
-            var url = asset.Value.GetProperty("browser_download_url").GetString();
-            if (!IsOfficialUrl(url)) return null;
-            if (!asset.Value.TryGetProperty("digest", out var digest)) return null;
-            var expected = ReadDigest(digest);
-            if (expected is null || expected.Length != 64 || expected.Any(c => !Uri.IsHexDigit(c))) return null;
-            var version = Sanitize(tag!); var destination = Path.Combine(_cacheRoot, version);
-            ElevationPolicy.RejectReparseAncestors(destination);
-            if (TryValidate(destination, expected, out var existing)) return Bundle(existing, tag!);
-            Directory.CreateDirectory(_cacheRoot);
-            ElevationPolicy.RejectReparseAncestors(Path.Combine(_cacheRoot, ".cache.lock"));
-            using var cacheLock = new FileStream(Path.Combine(_cacheRoot, ".cache.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-            if (TryValidate(destination, expected, out existing)) return Bundle(existing, tag!);
-            var staging = Path.Combine(_cacheRoot, ".staging-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(staging);
-            try
+            else
             {
-                var archive = Path.Combine(staging, "payload.7z");
-                await Download(url!, archive, ct).ConfigureAwait(false);
-                var hash = await HashFile(archive, ct).ConfigureAwait(false);
-                if (expected is not null && !hash.Equals(expected, StringComparison.OrdinalIgnoreCase)) return null;
-                var extracted = Path.Combine(staging, "extracted"); Directory.CreateDirectory(extracted);
-                Extract(archive, extracted, ct);
-                var payload = FindPayload(extracted); if (payload is null) return null;
-                var hashes = Directory.GetFiles(payload, "*", SearchOption.AllDirectories)
-                    .ToDictionary(p => Path.GetRelativePath(payload, p), p => HashFile(p, ct).GetAwaiter().GetResult());
-                var content = Path.Combine(staging, "content"); Directory.Move(payload, content);
-                await File.WriteAllTextAsync(Path.Combine(staging, "integrity.json"), JsonSerializer.Serialize(new CacheIntegrity(hash, hashes)), ct).ConfigureAwait(false);
-                File.Delete(archive);
-                if (Directory.Exists(destination)) { RejectReparseTree(destination); Directory.Delete(destination, true); }
-                Directory.CreateDirectory(destination);
-                Directory.Move(content, Path.Combine(destination, "content"));
-                File.Move(Path.Combine(staging, "integrity.json"), Path.Combine(destination, "integrity.json"));
-                return Bundle(Path.Combine(destination, "content"), tag!);
+                if (!response.IsSuccessStatusCode)
+                {
+                    LastError = $"GitHub Releases metadata returned HTTP {(int)response.StatusCode} ({response.ReasonPhrase}). For HTTP 403/429, retry after the API limit resets or select a manual payload directory.";
+                    return null;
+                }
+                await using var metadata = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                using var bounded = new MemoryStream();
+                var metadataBuffer = new byte[8192]; int read;
+                while ((read = await metadata.ReadAsync(metadataBuffer, ct).ConfigureAwait(false)) > 0)
+                { if (bounded.Length + read > 2 * 1024 * 1024) throw new InvalidDataException("Release metadata limit."); bounded.Write(metadataBuffer, 0, read); }
+                doc = JsonDocument.Parse(bounded.ToArray());
             }
-            finally { if (Directory.Exists(staging)) Directory.Delete(staging, true); }
+            using (doc)
+            {
+                var root = doc.RootElement; var tag = root.GetProperty("tag_name").GetString();
+                if (string.IsNullOrWhiteSpace(tag) || tag is "." or ".." || tag.Length > 100 || tag.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('.' or '-' or '_'))) return null;
+                var asset = SelectAsset(root); if (asset is null) return null;
+                var url = asset.Value.GetProperty("browser_download_url").GetString();
+                if (!IsOfficialUrl(url)) return null;
+                if (!asset.Value.TryGetProperty("digest", out var digest)) return null;
+                var expected = ReadDigest(digest);
+                if (expected is null || expected.Length != 64 || expected.Any(c => !Uri.IsHexDigit(c))) return null;
+                var version = Sanitize(tag!); var destination = Path.Combine(_cacheRoot, version);
+                ElevationPolicy.RejectReparseAncestors(destination);
+                if (TryValidate(destination, expected, out var existing)) return Bundle(existing, tag!);
+                Directory.CreateDirectory(_cacheRoot);
+                ElevationPolicy.RejectReparseAncestors(Path.Combine(_cacheRoot, ".cache.lock"));
+                using var cacheLock = new FileStream(Path.Combine(_cacheRoot, ".cache.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                if (TryValidate(destination, expected, out existing)) return Bundle(existing, tag!);
+                var staging = Path.Combine(_cacheRoot, ".staging-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(staging);
+                try
+                {
+                    var archive = Path.Combine(staging, "payload.7z");
+                    await Download(url!, archive, ct).ConfigureAwait(false);
+                    var hash = await HashFile(archive, ct).ConfigureAwait(false);
+                    if (expected is not null && !hash.Equals(expected, StringComparison.OrdinalIgnoreCase))
+                    { LastError = AddFallbackDiagnostic(fallbackDiagnostic, "Downloaded release SHA256 did not match the official digest."); return null; }
+                    var extracted = Path.Combine(staging, "extracted"); Directory.CreateDirectory(extracted);
+                    Extract(archive, extracted, ct);
+                    var payload = FindPayload(extracted); if (payload is null)
+                    { LastError = AddFallbackDiagnostic(fallbackDiagnostic, "Downloaded release does not contain OptiScaler.dll and OptiScaler.ini."); return null; }
+                    var hashes = Directory.GetFiles(payload, "*", SearchOption.AllDirectories)
+                        .ToDictionary(p => Path.GetRelativePath(payload, p), p => HashFile(p, ct).GetAwaiter().GetResult());
+                    var content = Path.Combine(staging, "content"); Directory.Move(payload, content);
+                    await File.WriteAllTextAsync(Path.Combine(staging, "integrity.json"), JsonSerializer.Serialize(new CacheIntegrity(hash, hashes)), ct).ConfigureAwait(false);
+                    File.Delete(archive);
+                    if (Directory.Exists(destination)) { RejectReparseTree(destination); Directory.Delete(destination, true); }
+                    Directory.CreateDirectory(destination);
+                    Directory.Move(content, Path.Combine(destination, "content"));
+                    File.Move(Path.Combine(staging, "integrity.json"), Path.Combine(destination, "integrity.json"));
+                    return Bundle(Path.Combine(destination, "content"), tag!);
+                }
+                finally { if (Directory.Exists(staging)) Directory.Delete(staging, true); }
+            }
         }
-        catch (OperationCanceledException) when (!callerToken.IsCancellationRequested) { LastError = "Release download timed out."; return null; }
+        catch (OperationCanceledException) when (!callerToken.IsCancellationRequested) { LastError = AddFallbackDiagnostic(fallbackDiagnostic, "Release download timed out."); return null; }
         catch (OperationCanceledException) { throw; }
-        catch (Exception ex) { LastError = ex.ToString(); return null; }
+        catch (Exception ex) { LastError = AddFallbackDiagnostic(fallbackDiagnostic, ex.ToString()); return null; }
     }
 
     private async Task Download(string? url, string path, CancellationToken ct)
@@ -111,6 +133,8 @@ public sealed class GitHubReleasePayloadSource : IPayloadSource
         await using var output = File.Create(path); var buffer = new byte[81920]; long total = 0; int n;
         while ((n = await input.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0) { total += n; if (total > _maxDownloadBytes) throw new InvalidDataException("download limit"); await output.WriteAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false); }
     }
+
+    private static string AddFallbackDiagnostic(string? fallback, string detail) => fallback is null ? detail : fallback + Environment.NewLine + detail;
 
     private void Extract(string archive, string destination, CancellationToken ct)
     {

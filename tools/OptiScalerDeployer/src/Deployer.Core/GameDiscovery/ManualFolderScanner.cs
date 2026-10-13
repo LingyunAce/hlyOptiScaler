@@ -23,9 +23,44 @@ public sealed class ManualFolderScanner : ScannerBase
         foreach (var entry in _store?.Load() ?? _entries ?? [])
         {
             ct.ThrowIfCancellationRequested();
-            var game = Create(entry.Title, GamePlatform.Manual, entry.Folder, "Manual", ct);
-            if (game is not null) result.Add(game);
+            try
+            {
+                var root = Fs.Path.GetFullPath(entry.Folder);
+                if (!XboxGameLibrary.IsRecognizedLibraryRoot(Fs, root)
+                    || XboxGameLibrary.HasTopLevelExecutable(Fs, root))
+                {
+                    var game = Create(entry.Title, GamePlatform.Manual, root, "Manual", ct);
+                    if (game is not null) AddUnique(result, game);
+                    continue;
+                }
+
+                foreach (var gameDirectory in Fs.Directory.GetDirectories(root))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try
+                    {
+                        if ((Fs.File.GetAttributes(gameDirectory) & FileAttributes.ReparsePoint) != 0) continue;
+                        var content = Fs.Path.Combine(gameDirectory, "Content");
+                        if (!XboxGameLibrary.IsGameContent(Fs, gameDirectory, content, ct, Warn)) continue;
+                        var game = Create(Fs.Path.GetFileName(gameDirectory), GamePlatform.Xbox, content, "Manual Xbox library", ct);
+                        if (game is not null) AddUnique(result, game);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                    { Warn($"无法扫描手动 Xbox 库条目 {gameDirectory}: {ex.Message}"); }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            { Warn($"无法扫描手动目录 {entry.Folder}: {ex.Message}"); }
         }
         return Task.FromResult<IReadOnlyList<DiscoveredGame>>(result);
+    }
+
+    private bool AddUnique(List<DiscoveredGame> result, DiscoveredGame game)
+    {
+        if (result.Any(existing => string.Equals(GameLibrary.Normalize(existing.InstallRoot),
+                GameLibrary.Normalize(game.InstallRoot), StringComparison.OrdinalIgnoreCase))) return false;
+        result.Add(game);
+        return true;
     }
 }
